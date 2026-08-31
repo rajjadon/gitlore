@@ -2,7 +2,7 @@
 export type LineExplanationState =
   | { status: 'pending' }
   | { status: 'done'; text: string }
-  | { status: 'noModel' }
+  | { status: 'noModel'; message: string }
   | { status: 'error'; message: string };
 
 /** Both the writer (LineExplanationService) and the reader (BlameHoverProvider) must compute the exact same key from the same inputs for a background click's result to ever be seen by a later hover. Pure — no I/O, no vscode import. */

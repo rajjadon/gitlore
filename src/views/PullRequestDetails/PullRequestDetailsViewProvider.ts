@@ -10,6 +10,7 @@ import type { LanguageModelClient } from '../../ai/LanguageModelClient';
 import type { GitLogger } from '../../core/git/errors';
 import { runCommitSummaryFlow } from '../../core/ai/commitSummaryFlow';
 import { buildPrExplanationPrompt, buildPrReviewDraftPrompt } from '../../core/ai/prompts';
+import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { pickMergeStrategy } from '../mergeStrategyPicker';
 import { CONFIG, MEDIA, VIEWS } from '../../constants';
 
@@ -413,7 +414,7 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
           this.postAiMessage({ type: 'aiSummaryCached', text: event.text });
           break;
         case 'noModel':
-          this.postAiMessage({ type: 'aiSummaryNoModel' });
+          this.postAiMessage({ type: 'aiSummaryNoModel', message: describeNoModelReason(vscode.env.appName) });
           break;
         case 'chunk':
           this.postAiMessage({ type: 'aiSummaryChunk', text: event.text });
@@ -494,7 +495,7 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
           // Never reached: this flow always passes cached: undefined.
           break;
         case 'noModel':
-          this.postAiMessage({ type: 'draftReviewNoModel' });
+          this.postAiMessage({ type: 'draftReviewNoModel', message: describeNoModelReason(vscode.env.appName) });
           break;
         case 'chunk':
           this.postAiMessage({ type: 'draftReviewChunk', text: event.text });

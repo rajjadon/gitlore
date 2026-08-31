@@ -115,7 +115,7 @@ window.addEventListener('message', (e) => {
   } else if (msg.type === 'chatNoModel') {
     toolStatusEl.hidden = true;
     hintEl.hidden = false;
-    hintEl.textContent = 'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.';
+    hintEl.textContent = msg.message;
     sendBtn.disabled = false;
   } else if (msg.type === 'chatReset') {
     toolStatusEl.hidden = true;

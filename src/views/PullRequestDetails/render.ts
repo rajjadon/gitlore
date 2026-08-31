@@ -308,7 +308,7 @@ window.addEventListener('message', (e) => {
     summaryText.hidden = true;
     summarySkeleton.hidden = true;
     summaryHint.hidden = false;
-    summaryHint.textContent = 'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.';
+    summaryHint.textContent = msg.message;
     explainBtn.disabled = false;
   } else if (msg.type === 'aiSummaryError') {
     summaryText.hidden = true;
@@ -322,7 +322,7 @@ window.addEventListener('message', (e) => {
     document.getElementById('draft-review').disabled = false;
     if (msg.type === 'draftReviewNoModel') {
       commentStatus.hidden = false;
-      commentStatus.textContent = 'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.';
+      commentStatus.textContent = msg.message;
     }
   } else if (msg.type === 'draftReviewError') {
     document.getElementById('draft-review').disabled = false;

@@ -128,10 +128,10 @@ test('formatBlameHover: done state escapes markdown special characters in the mo
   assert.ok(!md.includes('**bold**'));
 });
 
-test('formatBlameHover: noModel state shows the hint and a retry link', () => {
-  const state: LineExplanationState = { status: 'noModel' };
+test('formatBlameHover: noModel state shows the caller-supplied reason and a retry link', () => {
+  const state: LineExplanationState = { status: 'noModel', message: 'Cursor doesn\'t expose a language model.' };
   const md = formatBlameHover(entry, diffStat, 'tracked.txt', 'line three', state, now);
-  assert.match(md, /No language model available/);
+  assert.match(md, /Cursor doesn't expose a language model\./);
   assert.match(md, /\[\$\(sparkle\) Explain this line\]\(command:gitLore\.explainLine\?/);
 });
 
@@ -154,7 +154,7 @@ test('formatBlameHover: every render path ends with a trailing --- divider', () 
   // done
   assert.ok(endsWithDivider(formatBlameHover(entry, null, 'tracked.txt', 'line three', { status: 'done', text: 'short' }, now)));
   // noModel
-  assert.ok(endsWithDivider(formatBlameHover(entry, null, 'tracked.txt', 'line three', { status: 'noModel' }, now)));
+  assert.ok(endsWithDivider(formatBlameHover(entry, null, 'tracked.txt', 'line three', { status: 'noModel', message: 'x' }, now)));
   // error
   assert.ok(endsWithDivider(formatBlameHover(entry, null, 'tracked.txt', 'line three', { status: 'error', message: 'oops' }, now)));
 });

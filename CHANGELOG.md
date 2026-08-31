@@ -6,6 +6,10 @@ The VS Code Marketplace shows this file on GitLore's extension page, so entries 
 
 ## [Unreleased]
 
+### Fixed
+
+- **AI features on Cursor, Antigravity, and other VS Code forks now explain why, instead of telling you to install GitHub Copilot Chat** — that advice never worked there: `vscode.lm` is core API present in every fork, but forks have no way to register a provider under it (Copilot Chat won't activate outside real VS Code, and a fork's own AI isn't exposed through this API either). GitLore now detects the host editor and, on anything other than an official Microsoft VS Code build, shows a message naming the actual limitation instead of a dead-end suggestion. On real VS Code the message is unchanged.
+
 ## [1.2.4] - 2026-08-20
 
 ### Added

@@ -6,6 +6,7 @@ import type { LruCache } from '../core/cache/LruCache';
 import { runCommitSummaryFlow } from '../core/ai/commitSummaryFlow';
 import { buildLineExplanationPrompt } from '../core/ai/prompts';
 import { buildLineExplanationKey, type LineExplanationState } from '../core/ai/lineExplanationKey';
+import { describeNoModelReason } from '../core/ai/modelAvailability';
 import { CONFIG } from '../constants';
 
 /**
@@ -96,7 +97,7 @@ export class LineExplanationService {
             this.store.set(key, { status: 'done', text: event.text });
             break;
           case 'noModel':
-            this.store.set(key, { status: 'noModel' });
+            this.store.set(key, { status: 'noModel', message: describeNoModelReason(vscode.env.appName) });
             break;
           case 'error':
             this.logger.error('Line explanation failed', event.message);

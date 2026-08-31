@@ -7,6 +7,7 @@ import { openFileDiff } from '../../providers/GitContentProvider';
 import { renderPlaceholderHtml } from '../placeholder';
 import { waitForWebviewView } from '../waitForWebviewView';
 import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
+import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { buildForgeClient } from '../../core/forge/buildForgeClient';
 import { detectForgeHost, type DetectedForgeHost, type ForgeHostConfig } from '../../core/forge/hostDetection';
 import { resolveForgeRepoRef } from '../../core/forge/resolveRepoRef';
@@ -398,7 +399,7 @@ export class BranchComparisonViewProvider implements vscode.WebviewViewProvider 
           this.postAiMessage({ type: 'aiSummaryCached', text: event.text });
           break;
         case 'noModel':
-          this.postAiMessage({ type: 'aiSummaryNoModel' });
+          this.postAiMessage({ type: 'aiSummaryNoModel', message: describeNoModelReason(vscode.env.appName) });
           break;
         case 'chunk':
           this.postAiMessage({ type: 'aiSummaryChunk', text: event.text });

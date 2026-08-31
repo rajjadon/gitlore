@@ -126,6 +126,7 @@ suite('Blame hover card', () => {
 
     assert.deepEqual(await api.getLineExplanationStateForTest(manifest.trackedFile, commit.sha, 'line three'), {
       status: 'noModel',
+      message: 'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.',
     });
 
     const doc = await vscode.workspace.openTextDocument(manifest.trackedFile);

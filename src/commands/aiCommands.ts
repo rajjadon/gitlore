@@ -8,6 +8,7 @@ import type { CommitMessageService } from '../ai/CommitMessageService';
 import type { ChangelogService } from '../ai/ChangelogService';
 import type { GitService } from '../core/git/GitService';
 import { resolveRepoContextPath } from '../views/CommitGraph/CommitGraphViewProvider';
+import { describeNoModelReason } from '../core/ai/modelAvailability';
 
 /** The subset of `vscode.git`'s exported API GitLore uses — not part of `@types/vscode`, so declared locally. */
 interface GitExtensionApi {
@@ -153,9 +154,7 @@ export function handleGenerateCommitMessageCommand(service: CommitMessageService
               void vscode.window.showInformationMessage('GitLore: stage some changes first.');
               break;
             case 'noModel':
-              void vscode.window.showInformationMessage(
-                'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.',
-              );
+              void vscode.window.showInformationMessage(describeNoModelReason(vscode.env.appName));
               break;
             case 'chunk': {
               const repo = await resolveRepository();
@@ -223,9 +222,7 @@ export function handleGenerateChangelogCommand(service: ChangelogService, git: G
               void vscode.window.showInformationMessage(`GitLore: no commits between ${from} and ${to}.`);
               break;
             case 'noModel':
-              void vscode.window.showInformationMessage(
-                'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.',
-              );
+              void vscode.window.showInformationMessage(describeNoModelReason(vscode.env.appName));
               break;
             case 'chunk':
               fullText += event.text;

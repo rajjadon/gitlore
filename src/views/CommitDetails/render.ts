@@ -170,7 +170,7 @@ window.addEventListener('message', (e) => {
     summaryText.hidden = true;
     summarySkeleton.hidden = true;
     summaryHint.hidden = false;
-    summaryHint.textContent = 'No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.';
+    summaryHint.textContent = msg.message;
     explainBtn.disabled = false;
   } else if (msg.type === 'aiSummaryError') {
     summaryText.hidden = true;

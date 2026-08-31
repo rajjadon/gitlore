@@ -3,6 +3,7 @@ import { renderChatHtml } from './render';
 import { resolveRepoContextPath } from '../CommitGraph/CommitGraphViewProvider';
 import { waitForWebviewView } from '../waitForWebviewView';
 import type { ChatService } from '../../ai/ChatService';
+import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { MEDIA, VIEWS } from '../../constants';
 
 function createNonce(): string {
@@ -112,7 +113,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.postChatMessage({ type: 'chatReset' });
           break;
         case 'noModel':
-          this.postChatMessage({ type: 'chatNoModel' });
+          this.postChatMessage({ type: 'chatNoModel', message: describeNoModelReason(vscode.env.appName) });
           break;
         case 'toolCall':
           this.postChatMessage({ type: 'chatToolCall', name: event.name });

@@ -96,7 +96,7 @@ function formatLineExplanation(
       return `$(sparkle) **Why this line exists**\n\n${escapeMarkdown(truncated)}`;
     }
     case 'noModel':
-      return `No language model available. Enable a language model (e.g. GitHub Copilot Chat) to use this feature.\n\n${buildExplainLineLink(filePath, sha, lineContent)}`;
+      return `${state.message}\n\n${buildExplainLineLink(filePath, sha, lineContent)}`;
     case 'error':
       return `Failed to generate explanation: ${escapeMarkdown(state.message)}\n\n${buildExplainLineLink(filePath, sha, lineContent)}`;
   }
