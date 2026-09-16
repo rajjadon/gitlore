@@ -6,8 +6,11 @@ The VS Code Marketplace shows this file on GitLore's extension page, so entries 
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-09-16
+
 ### Fixed
 
+- **Multi-root workspaces: opening a terminal in another repo now switches GitLore's context to it** — previously, with no editor open, every GitLore feature (Sidebar Explorer, Commit Graph, status bar init, AI commands, etc.) fell straight through to the workspace's first folder regardless of which repo you were actually working in. GitLore now checks the active terminal's working directory before falling back to the first folder.
 - **AI features on Cursor, Antigravity, and other VS Code forks now explain why, instead of telling you to install GitHub Copilot Chat** — that advice never worked there: `vscode.lm` is core API present in every fork, but forks have no way to register a provider under it (Copilot Chat won't activate outside real VS Code, and a fork's own AI isn't exposed through this API either). GitLore now detects the host editor and, on anything other than an official Microsoft VS Code build, shows a message naming the actual limitation instead of a dead-end suggestion. On real VS Code the message is unchanged.
 
 ## [1.2.4] - 2026-08-20

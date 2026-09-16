@@ -27,11 +27,35 @@ function createNonce(): string {
 
 /**
  * Any path inside the repo will do — every `GitService` call resolves the repo root from it. The
- * active editor is preferred (correct repo in a multi-root workspace), with the first workspace
- * folder as a fallback so the graph still opens when no editor is showing.
+ * active editor is preferred (correct repo in a multi-root workspace); when no editor is open, the
+ * active terminal's cwd is tried next, so switching context by opening a terminal scoped to a repo
+ * (rather than clicking a file in it) still resolves to that repo instead of silently falling
+ * through to the first workspace folder. The first workspace folder remains the last resort so the
+ * graph still opens when neither signal is available.
  */
 export function resolveRepoContextPath(): string | undefined {
-  return vscode.window.activeTextEditor?.document.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  return (
+    vscode.window.activeTextEditor?.document.uri.fsPath ??
+    activeTerminalCwd() ??
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  );
+}
+
+/** Shell integration's live cwd (tracks `cd`) wins when available; the terminal's launch-time cwd otherwise. */
+function activeTerminalCwd(): string | undefined {
+  const terminal = vscode.window.activeTerminal;
+  if (!terminal) {
+    return undefined;
+  }
+  const shellCwd = terminal.shellIntegration?.cwd;
+  if (shellCwd) {
+    return shellCwd.fsPath;
+  }
+  const cwd = 'cwd' in terminal.creationOptions ? terminal.creationOptions.cwd : undefined;
+  if (!cwd) {
+    return undefined;
+  }
+  return typeof cwd === 'string' ? cwd : cwd.fsPath;
 }
 
 export function readMaxGraphItems(): number {

@@ -1,5 +1,5 @@
 import * as assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as vscode from 'vscode';
 import { MANIFEST_PATH, type FixtureManifest, buildSyncFixtureRepo, buildExplorerFixtureRepo } from '../fixtures/build-fixture-repo';
@@ -106,6 +106,25 @@ suite('Commit graph webview', () => {
 
     // And the command itself stays quiet rather than throwing.
     await vscode.commands.executeCommand(COMMANDS.openGraph);
+  });
+
+  test('prefers the active terminal\'s cwd over the workspace folder when no editor is open', async () => {
+    const fixture = buildExplorerFixtureRepo();
+    await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+    assert.equal(vscode.window.activeTextEditor, undefined);
+
+    const terminal = vscode.window.createTerminal({ name: 'gitlore-test-cwd', cwd: fixture.repoRoot });
+    try {
+      terminal.show(false);
+      await waitFor(() => vscode.window.activeTerminal === terminal);
+
+      const contextPath = resolveRepoContextPath();
+      assert.ok(contextPath, 'expected a repo context path from the active terminal');
+      const repoRoot = await api.git.getRepoRoot(contextPath as string);
+      assert.equal(repoRoot, realpathSync(fixture.repoRoot));
+    } finally {
+      terminal.dispose();
+    }
   });
 
   test('shows pull/push buttons badged with the real ahead/behind counts against the upstream', async () => {

@@ -24,7 +24,7 @@ It does that without leaving your editor, without signing in, and without sendin
 
 If you've used similar VS Code git extensions, GitLore covers the same core ground — inline blame, a commit graph, commit details, branch comparison — with every feature free and a deliberately smaller surface area. See [How it compares](#how-it-compares).
 
-> **Status: 1.2, stable.** Everything below works and is covered by tests — 743 unit tests and 163 integration tests against a real VS Code instance. Bug reports are very welcome.
+> **Status: 1.2, stable.** Everything below works and is covered by tests — 743 unit tests and 164 integration tests against a real VS Code instance. Bug reports are very welcome.
 
 ## Install
 
@@ -37,7 +37,7 @@ code --install-extension RajpratapsinghJadon.gitlore
 **From a `.vsix`** — grab one from [Releases](https://github.com/rajjadon/gitlore/releases), then:
 
 ```bash
-code --install-extension gitlore-1.2.4.vsix
+code --install-extension gitlore-1.2.5.vsix
 ```
 
 Requires **VS Code 1.85+** and `git` on your `PATH`. Works in Cursor and other VS Code-based editors.
