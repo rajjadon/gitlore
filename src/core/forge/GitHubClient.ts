@@ -226,6 +226,10 @@ export class GitHubClient implements ForgeClient {
         const items = (await res.json()) as GitHubClosedPull[];
         return { items, next: nextLinkFromHeader(res.headers.get('link')) };
       },
+      // One page by design: `ForgeClient.listRecentlyClosedPullRequests` is a bounded
+      // most-recently-updated slice, and following Link would cost up to MAX_PAGES requests per
+      // repo per refresh to find the few closed PRs the user authored.
+      1,
     );
     return raw.map((pull) => ({
       repo,

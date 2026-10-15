@@ -6,8 +6,22 @@ The VS Code Marketplace shows this file on GitLore's extension page, so entries 
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-10-16
+
+### Fixed
+
+- **Launchpad: a temporary network or server error no longer deletes your saved access token** — previously any failed request while loading a repo (a rate limit, a 5xx, a dropped connection) cleared the stored Personal Access Token and re-prompted you for it. Now only a genuine "unauthorized" (HTTP 401) response clears it; every other failure shows an error on that repo's row and leaves your token alone.
+- **Launchpad: repos with more than ~100 open PRs no longer silently drop the rest** — GitHub, GitLab, Bitbucket, and Azure DevOps all used to stop at the first page of open PRs with no warning. The open-PR list now pages through everything the host returns, up to about 1,000 per repo, and GitHub's per-PR review and check-run lookups page too (so a PR with more than 100 reviews no longer loses the newest ones).
+- **Launchpad: a slow, hung, or rate-limited host now fails visibly instead of hanging or looking empty** — requests time out after 30 seconds, and read-only requests retry briefly on a rate limit or a temporary server error (honoring the host's own wait time). A rate-limited GitHub check-run or review lookup used to be swallowed into "no checks, no reviews" — it now shows as an error on that repo. Merge, approve, comment, and other writes are never retried automatically, so they can't be duplicated.
+- **GitHub: a reviewer's later plain comment no longer hides their earlier "Changes requested" or approval** — only an actual approve, request-changes, or dismissal changes a reviewer's standing. An approval also now counts when other reviewers are merely still requested, instead of leaving the PR stuck on "review required".
+- **GitLab: unresolved discussion threads no longer show a PR as "Changes requested"** — that overrode a real approval. GitLab has no such state, so the board now reflects approvals only.
+- **GitHub: Merge & Delete Branch no longer risks deleting the wrong branch on a fork PR** — the branch is now deleted only when it lives in the same repo as the PR's target. For a PR from a fork, the branch is left for the host's own cleanup setting.
+- **PR matching ignores letter case** — GitHub treats logins case-insensitively, so a PR you authored or were asked to review could be missed when the case differed between the API and your signed-in name.
+
 ### Changed
 
+- **Launchpad loads all your repos at once** — the board used to fetch one repo at a time, so a workspace with several repos waited on the sum of every host's response time instead of the slowest one. A repo that fails no longer holds up or blanks the rest. Sign-in prompts still appear one at a time.
+- **Launchpad: snoozing a card is instant** — it re-sorts the board from what's already loaded instead of re-fetching every repo over the network. Snoozed entries for PRs that no longer exist are now cleaned up automatically.
 - **Launchpad: GitHub board refresh makes 3× fewer API requests for PRs you're not involved in** — previously every open PR fetched reviews, check-run status, and mergeable state (3 calls each). PRs where you're neither the author nor a requested reviewer now fetch only reviews (1 call); if you've never reviewed the PR it's omitted from the board entirely, since it can't appear in any category. PRs you authored or were asked to review still get the full 3-call enrichment.
 
 ## [1.2.5] - 2026-09-16

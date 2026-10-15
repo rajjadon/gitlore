@@ -412,6 +412,14 @@ export async function submitReviewFlow(ctx: ActionContext, decision: ReviewSubmi
 
 ---
 
+### Phase A carry-over (found while preparing the 1.2.6 release)
+
+Phase A shipped as 1.2.6 with these gaps, verified by reading the code — **not** delivered despite Task A4 Step 2 listing them:
+
+- **Still unpaginated, single request (first page only):** GitHub `/pulls/{n}/files` and GraphQL `reviewThreads(first: 100)` (no `pageInfo`); GitLab MR `/diffs` and `/discussions`; Bitbucket `/diffstat`, `/comments`, commit `/statuses`; Azure DevOps `iterations/{n}/changes` and `/threads`. Fold into **B2** (threads/comments get rewritten there anyway) and **B1** (diff fetch is being reworked and cached there). Add a pinning test per call (exactly 100 / 101 items).
+- **Fixed in the release prep:** GitHub `listRecentlyClosedPullRequests` had been given the full `MAX_PAGES` walk (up to 10 requests per repo per refresh) — now pinned to one page, with a test. The closed lists on GitLab/Bitbucket/Azure were never paged and are untouched (they are documented as a bounded slice).
+- **Process note:** the implementer's report described A4 as complete and the verifier did not check per-call pagination. For Phase B, the verifier brief must list each acceptance point from the plan explicitly instead of generic checks.
+
 ## Phase B — PR review depth (webview) · size L · needs its own design
 
 | ID | Item | Size | Hosts | Notes |

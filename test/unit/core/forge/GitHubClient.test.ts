@@ -825,6 +825,35 @@ test('A4: listOpenPullRequests stops at MAX_PAGES when Link next always present'
   assert.equal(result.length, MAX_PAGES, 'one PR per page');
 });
 
+// The closed list is a documented "bounded, most-recently-updated slice" — following Link here
+// turned one request per repo per refresh into up to MAX_PAGES (~1000 closed PRs) to find a few of
+// the user's own.
+test('listRecentlyClosedPullRequests: stays one request even when the host offers a next page', async () => {
+  let callCount = 0;
+  const client = new GitHubClient(BASE, 'tok', (async () => {
+    callCount++;
+    return jsonResponseWithLink(
+      [
+        {
+          number: callCount,
+          title: `Closed ${callCount}`,
+          html_url: `https://github.com/acme/widgets/pull/${callCount}`,
+          user: { login: 'alice' },
+          draft: false,
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+          closed_at: '2024-01-02T00:00:00Z',
+          merged_at: null,
+        },
+      ],
+      `${BASE}/repos/acme/widgets/pulls?state=closed&per_page=100&page=${callCount + 1}`,
+    );
+  }) as typeof fetch);
+  const result = await client.listRecentlyClosedPullRequests(REPO);
+  assert.equal(callCount, 1, 'exactly one closed-list request');
+  assert.equal(result.length, 1, 'only the first page is returned');
+});
+
 test('A4: reviews are paginated — a review on page 2 is not lost', async () => {
   const page2ReviewsUrl = `${BASE}/repos/acme/widgets/pulls/1/reviews?per_page=100&page=2`;
   const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
