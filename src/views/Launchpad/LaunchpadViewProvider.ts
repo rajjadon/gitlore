@@ -3,13 +3,12 @@ import { GitService } from '../../core/git/GitService';
 import type { GitLogger } from '../../core/git/errors';
 import { parseRemoteUrl } from '../../core/git/parsers';
 import { buildForgeClient } from '../../core/forge/buildForgeClient';
-import { categorizeClosedPullRequests, categorizePullRequests } from '../../core/forge/categorize';
+import { loadBoard, recategorize, pruneSnoozed, collectLivePrKeys, type BoardRepoInput } from '../../core/forge/loadBoard';
 import { detectForgeHost, type DetectedForgeHost, type ForgeHostConfig } from '../../core/forge/hostDetection';
 import type { ForgeClient } from '../../core/forge/ForgeClient';
 import { resolveForgeRepoRef } from '../../core/forge/resolveRepoRef';
 import {
   pullRequestKey,
-  type CategorizedPullRequest,
   type ForgeRepoRef,
   type MergeStrategy,
   type PullRequestSummary,
@@ -20,9 +19,30 @@ import { renderLaunchpadHtml, type LaunchpadRepoError, type LaunchpadRepoRow } f
 import { renderPlaceholderHtml } from '../placeholder';
 import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
 import { runInGitSyncTerminal } from '../gitSyncTerminal';
-import { pickMergeStrategy } from '../mergeStrategyPicker';
+import { closePullRequestFlow, mergePullRequestFlow, reopenPullRequestFlow, submitReviewFlow, type PullRequestActionUi } from '../pullRequestActions';
+import { vscodePullRequestActionUi } from '../pullRequestActionUi';
 
 const SNOOZE_STATE_KEY = 'gitLore.launchpad.snoozed';
+
+/** Returns a PullRequestActionUi that auto-confirms the first matching button — used by ForTest methods so integration tests exercise real flow logic without driving an interactive modal. */
+function autoConfirmUi(confirmButton: string): PullRequestActionUi {
+  return {
+    async confirm(_message, ...buttons) { return buttons.find((b) => b === confirmButton); },
+    async pickMergeStrategy() { return undefined; },
+    warn() {},
+    error() {},
+  };
+}
+
+/** Returns a PullRequestActionUi for the merge ForTest path — auto-picks a fixed strategy and confirm button. */
+function autoMergeUi(strategy: MergeStrategy, deleteSourceBranch: boolean): PullRequestActionUi {
+  return {
+    async confirm(_message, ...buttons) { return buttons.find((b) => b === (deleteSourceBranch ? 'Merge & Delete Branch' : 'Merge')); },
+    async pickMergeStrategy() { return strategy; },
+    warn() {},
+    error() {},
+  };
+}
 
 function createNonce(): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -55,6 +75,10 @@ export class LaunchpadViewProvider implements vscode.Disposable {
   private repoLabelByKey = new Map<string, string>();
   /** Rebuilt on every refresh — the signed-in login per repo, so `submitReview` can catch "you're reviewing your own PR" before ever calling the host's API. Every host we support rejects a self-review one way or another; catching it here turns that into one clear message instead of a different opaque API error per host. */
   private loginByRepoKey = new Map<string, string>();
+  /** The last full-load raw PR data per repo — lets `recategorize` re-bucket without a network call (e.g. after toggling snooze). */
+  private rawByRepoKey: Map<string, { login: string; open: PullRequestSummary[]; closed: PullRequestSummary[] }> = new Map();
+  private cachedErrors: Array<{ repo: ForgeRepoRef; message: string }> = [];
+  private cachedRepoRows: LaunchpadRepoRow[] = [];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -130,83 +154,90 @@ export class LaunchpadViewProvider implements vscode.Disposable {
       return;
     }
 
-    const categorized: CategorizedPullRequest[] = [];
-    const errors: LaunchpadRepoError[] = [];
-    this.clientsByRepoKey = new Map();
-    this.prsByKey = new Map();
-    this.repoRootByKey = new Map();
-    this.loginByRepoKey = new Map();
-    this.detectedByRepoKey = new Map();
-    this.repoLabelByKey = new Map();
+    // Resolve tokens sequentially — resolveForgeToken may show an input box, and parallelizing
+    // it would stack several prompts at once on a multi-root workspace.
+    const newClientsByRepoKey = new Map<string, ForgeClient>();
+    const newRepoRootByKey = new Map<string, string>();
+    const newDetectedByRepoKey = new Map<string, DetectedForgeHost>();
+    const newRepoLabelByKey = new Map<string, string>();
     const repoRows: LaunchpadRepoRow[] = [];
+    const boardInputs: BoardRepoInput[] = [];
 
     for (const { repo, detected, repoRoot } of repos) {
       const repoKey = `${repo.host}:${repo.identity}`;
-      this.repoRootByKey.set(repoKey, repoRoot);
-      this.detectedByRepoKey.set(repoKey, detected);
-      this.repoLabelByKey.set(repoKey, repo.label);
+      newRepoRootByKey.set(repoKey, repoRoot);
+      newDetectedByRepoKey.set(repoKey, detected);
+      newRepoLabelByKey.set(repoKey, repo.label);
       repoRows.push({ key: repoKey, label: repo.label });
-      try {
-        const token = await resolveForgeToken(this.context.secrets, detected);
-        if (!token) {
-          errors.push({ repo, message: 'Not signed in.' });
-          continue;
-        }
-        const client = buildForgeClient(
-          detected.flavor,
-          detected.apiBaseUrl,
-          repo.identity,
-          token,
-          azureDevOpsCredentialScheme(detected),
-          this.fetchImpl,
-        );
 
-        let login: string | null;
-        try {
-          login = await client.getAuthenticatedLogin();
-        } catch (err) {
-          // Bad/expired/wrongly-scoped credential, or the host unreachable — clear it so the
-          // *next* refresh re-prompts instead of retrying the same bad credential forever, and
-          // show the real reason (HTTP status, network failure) instead of a one-size-fits-all
-          // "couldn't authenticate" that gives the user nothing to act on.
+      const token = await resolveForgeToken(this.context.secrets, detected);
+      if (!token) {
+        boardInputs.push({ repo, client: null, displayHost: detected.displayHost });
+        continue;
+      }
+      const client = buildForgeClient(
+        detected.flavor,
+        detected.apiBaseUrl,
+        repo.identity,
+        token,
+        azureDevOpsCredentialScheme(detected),
+        this.fetchImpl,
+      );
+      newClientsByRepoKey.set(repoKey, client);
+      boardInputs.push({ repo, client, displayHost: detected.displayHost });
+    }
+
+    const result = await loadBoard({
+      repos: boardInputs,
+      isSnoozed: (pr) => this.isSnoozed(pr),
+      onCredentialRejected: async (repo) => {
+        const detected = newDetectedByRepoKey.get(`${repo.host}:${repo.identity}`);
+        if (detected) {
           await clearForgeToken(this.context.secrets, detected);
-          const reason = err instanceof Error ? err.message : String(err);
-          this.logger?.error(`Launchpad failed to authenticate with ${detected.displayHost}`, err);
-          errors.push({ repo, message: `Couldn't authenticate with ${detected.displayHost}: ${reason}` });
-          continue;
         }
-        if (!login) {
-          await clearForgeToken(this.context.secrets, detected);
-          errors.push({ repo, message: `Couldn't authenticate with ${detected.displayHost}.` });
-          continue;
-        }
-        this.clientsByRepoKey.set(`${repo.host}:${repo.identity}`, client);
-        this.loginByRepoKey.set(`${repo.host}:${repo.identity}`, login);
-        const [prs, closedPrs] = await Promise.all([client.listOpenPullRequests(repo), client.listRecentlyClosedPullRequests(repo)]);
-        const openCategorized = categorizePullRequests(prs, login, (pr) => this.isSnoozed(pr));
-        const closedCategorized = categorizeClosedPullRequests(closedPrs, login);
-        categorized.push(...openCategorized, ...closedCategorized);
-        // Merged/closed PRs need to be resolvable too — View diff (rendered on every card,
-        // terminal or not) and the new Reopen action both look a card's key up here.
-        for (const { pr } of [...openCategorized, ...closedCategorized]) {
-          this.prsByKey.set(pullRequestKey(pr), pr);
-        }
-      } catch (err) {
-        // A PR list call failing (as opposed to succeeding with zero results) almost always means
-        // the credential itself is bad — expired, or scoped for identity but not this host's PR
-        // API (e.g. an Azure DevOps PAT missing "Code" scope). Clear it so the next refresh
-        // re-prompts instead of silently showing an empty board forever.
-        await clearForgeToken(this.context.secrets, detected);
-        const message = err instanceof Error ? err.message : String(err);
-        this.logger?.error(`Launchpad failed to load ${repo.label}`, err);
-        errors.push({ repo, message });
+      },
+      logError: (msg, err) => this.logger?.error(msg, err),
+    });
+
+    // Swap out all instance state atomically so actions that look up a PR or client
+    // always see a consistent snapshot.
+    this.clientsByRepoKey = newClientsByRepoKey;
+    this.loginByRepoKey = result.loginByRepoKey;
+    this.repoRootByKey = newRepoRootByKey;
+    this.detectedByRepoKey = newDetectedByRepoKey;
+    this.repoLabelByKey = newRepoLabelByKey;
+    this.rawByRepoKey = result.rawByRepoKey;
+    this.cachedErrors = result.errors;
+    this.cachedRepoRows = repoRows;
+
+    // Populate prsByKey from the raw data — merged/closed PRs need it too (View diff, Reopen).
+    this.prsByKey = new Map();
+    for (const { open, closed } of result.rawByRepoKey.values()) {
+      for (const pr of [...open, ...closed]) {
+        this.prsByKey.set(pullRequestKey(pr), pr);
       }
     }
+
+    // Prune snoozed keys that belong to PRs no longer in the board — keeps globalState tidy (L7).
+    const livePrKeys = collectLivePrKeys(result.rawByRepoKey);
+    const prunedSnoozed = pruneSnoozed(this.readSnoozed(), livePrKeys);
+    await this.context.globalState.update(SNOOZE_STATE_KEY, prunedSnoozed);
 
     if (!this.panel) {
       return;
     }
-    this.panel.webview.html = renderLaunchpadHtml({ categorized, errors, repoRows }, renderOpts);
+    this.panel.webview.html = renderLaunchpadHtml({ categorized: result.categorized, errors: result.errors, repoRows }, renderOpts);
+  }
+
+  /** Re-renders the board from cached raw data — no network call. Used after snooze toggling (L6). */
+  private renderFromCache(): void {
+    if (!this.panel) {
+      return;
+    }
+    const categorized = recategorize(this.rawByRepoKey, (pr) => this.isSnoozed(pr));
+    const styleUris = [this.mediaUri(MEDIA.shared), this.mediaUri(MEDIA.launchpad)];
+    const renderOpts = { nonce: createNonce(), cspSource: this.panel.webview.cspSource, styleUris };
+    this.panel.webview.html = renderLaunchpadHtml({ categorized, errors: this.cachedErrors, repoRows: this.cachedRepoRows }, renderOpts);
   }
 
   private readCustomHosts(): ForgeHostConfig[] {
@@ -272,21 +303,20 @@ export class LaunchpadViewProvider implements vscode.Disposable {
     await this.context.globalState.update(SNOOZE_STATE_KEY, next);
   }
 
-  /** Test-only introspection seam — a webview button click can't be simulated in an integration test, so this drives the same toggle-then-refresh flow the snooze button's message handler does. */
+  /** Test-only introspection seam — a webview button click can't be simulated in an integration test, so this drives the same toggle-then-render-from-cache flow the snooze button's message handler does. */
   async toggleSnoozeForTest(key: string): Promise<void> {
     await this.toggleSnooze(key);
-    await this.refresh(false);
+    this.renderFromCache();
   }
 
   private async handleMessage(message: unknown): Promise<void> {
     if (typeof message !== 'object' || message === null) {
       return;
     }
-    const { type, url, key, title, decision } = message as {
+    const { type, url, key, decision } = message as {
       type?: unknown;
       url?: unknown;
       key?: unknown;
-      title?: unknown;
       decision?: unknown;
     };
 
@@ -296,23 +326,23 @@ export class LaunchpadViewProvider implements vscode.Disposable {
     }
     if (type === 'toggleSnooze' && typeof key === 'string') {
       await this.toggleSnooze(key);
-      await this.refresh(false);
+      this.renderFromCache();
       return;
     }
     if (type === 'closePr' && typeof key === 'string') {
-      await this.closePullRequest(key, typeof title === 'string' ? title : key);
+      await this.closePullRequest(key);
       return;
     }
     if (type === 'reopenPr' && typeof key === 'string') {
-      await this.reopenPullRequest(key, typeof title === 'string' ? title : key);
+      await this.reopenPullRequest(key);
       return;
     }
     if (type === 'mergePr' && typeof key === 'string') {
-      await this.mergePullRequest(key, typeof title === 'string' ? title : key);
+      await this.mergePullRequest(key);
       return;
     }
     if (type === 'submitReview' && typeof key === 'string' && (decision === 'approve' || decision === 'requestChanges')) {
-      await this.submitReview(key, typeof title === 'string' ? title : key, decision);
+      await this.submitReview(key, decision);
       return;
     }
     if (type === 'showPullRequestDetails' && typeof key === 'string') {
@@ -408,180 +438,74 @@ export class LaunchpadViewProvider implements vscode.Disposable {
     return { pr, client };
   }
 
-  private async closePullRequest(key: string, title: string): Promise<void> {
+  /** Resolves a card key to a PR and client pair. Returns undefined if the card is no longer on the board. */
+  private resolveActionCtx(key: string): { pr: PullRequestSummary; client: ForgeClient } | undefined {
     const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const confirmed = await vscode.window.showWarningMessage(`Close "${title}"? This closes it on ${pr.repo.label} without merging.`, { modal: true }, 'Close PR');
-    if (confirmed !== 'Close PR') {
-      return;
-    }
+    if (!pr) return undefined;
     const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    try {
-      await client.closePullRequest(pr.repo, pr.number);
-      await this.refresh(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger?.error(`Launchpad failed to close PR ${key}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't close the PR — ${message}`);
-    }
+    if (!client) return undefined;
+    return { pr, client };
   }
 
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the close flow directly, skipping only the modal. */
+  private async runFlow(key: string, flow: (pr: PullRequestSummary, client: ForgeClient, ui: PullRequestActionUi) => Promise<boolean>, ui: PullRequestActionUi = vscodePullRequestActionUi): Promise<void> {
+    const resolved = this.resolveActionCtx(key);
+    if (!resolved) return;
+    const changed = await flow(resolved.pr, resolved.client, ui);
+    if (changed) await this.refresh(false);
+  }
+
+  private async closePullRequest(key: string): Promise<void> {
+    await this.runFlow(key, (pr, client, ui) => closePullRequestFlow({
+      pr, client, ui, logError: (m, e) => this.logger?.error(`Launchpad: ${m}`, e),
+    }));
+  }
+
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the close flow with an auto-confirming UI. */
   async closePullRequestForTest(key: string): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    await client.closePullRequest(pr.repo, pr.number);
-    await this.refresh(false);
+    await this.runFlow(key, (pr, client, ui) => closePullRequestFlow({ pr, client, ui, logError: () => undefined }), autoConfirmUi('Close PR'));
   }
 
-  private async reopenPullRequest(key: string, title: string): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const confirmed = await vscode.window.showWarningMessage(`Reopen "${title}" on ${pr.repo.label}?`, { modal: true }, 'Reopen PR');
-    if (confirmed !== 'Reopen PR') {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    try {
-      await client.reopenPullRequest(pr.repo, pr.number);
-      await this.refresh(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger?.error(`Launchpad failed to reopen PR ${key}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't reopen the PR — ${message}`);
-    }
+  private async reopenPullRequest(key: string): Promise<void> {
+    await this.runFlow(key, (pr, client, ui) => reopenPullRequestFlow({
+      pr, client, ui, logError: (m, e) => this.logger?.error(`Launchpad: ${m}`, e),
+    }));
   }
 
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the reopen flow directly, skipping only the modal. */
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the reopen flow with an auto-confirming UI. */
   async reopenPullRequestForTest(key: string): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    await client.reopenPullRequest(pr.repo, pr.number);
-    await this.refresh(false);
+    await this.runFlow(key, (pr, client, ui) => reopenPullRequestFlow({ pr, client, ui, logError: () => undefined }), autoConfirmUi('Reopen PR'));
   }
 
-  /**
-   * A QuickPick for the strategy (filtered to what this PR's host actually supports), then one
-   * modal confirm with two buttons — "Merge" and "Merge & Delete Branch" — rather than a third,
-   * separate prompt for the delete-branch choice. Escaping either prompt aborts without calling
-   * the host at all, same as every other confirmed Launchpad action.
-   */
-  private async mergePullRequest(key: string, title: string): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const strategy = await pickMergeStrategy(pr);
-    if (!strategy) {
-      return;
-    }
-    const confirmed = await vscode.window.showWarningMessage(
-      `Merge "${title}" on ${pr.repo.label}? This can't be undone.`,
-      { modal: true },
-      'Merge',
-      'Merge & Delete Branch',
-    );
-    if (confirmed !== 'Merge' && confirmed !== 'Merge & Delete Branch') {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    try {
-      await client.mergePullRequest(pr.repo, pr.number, { strategy, deleteSourceBranch: confirmed === 'Merge & Delete Branch' });
-      await this.refresh(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger?.error(`Launchpad failed to merge PR ${key}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't merge the PR — ${message}`);
-    }
+  private async mergePullRequest(key: string): Promise<void> {
+    await this.runFlow(key, (pr, client, ui) => mergePullRequestFlow({
+      pr, client, ui, logError: (m, e) => this.logger?.error(`Launchpad: ${m}`, e),
+    }));
   }
 
-  /** Test-only introspection seam — the merge QuickPick and confirmation modal can't be driven from an integration test, so this calls the merge flow directly with a fixed strategy/delete choice, skipping both prompts. */
+  /** Test-only introspection seam — the merge QuickPick and confirmation modal can't be driven from an integration test, so this calls the merge flow with a fixed strategy/delete choice. */
   async mergePullRequestForTest(key: string, strategy: MergeStrategy, deleteSourceBranch: boolean): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    await client.mergePullRequest(pr.repo, pr.number, { strategy, deleteSourceBranch });
-    await this.refresh(false);
+    await this.runFlow(
+      key,
+      (pr, client, ui) => mergePullRequestFlow({ pr, client, ui, logError: () => undefined }),
+      autoMergeUi(strategy, deleteSourceBranch),
+    );
   }
 
-  /** Every host we support rejects a review from the PR's own author one way or another — catching it here, before the API call, turns that into one clear message instead of a different opaque rejection per host (see the 422 GitHub returns for exactly this). */
-  private isOwnPullRequest(pr: PullRequestSummary): boolean {
-    const login = this.loginByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    return !!login && pr.authorLogin.toLowerCase() === login.toLowerCase();
+  private async submitReview(key: string, decision: ReviewSubmission): Promise<void> {
+    const resolved = this.resolveActionCtx(key);
+    if (!resolved) return;
+    const myLogin = this.loginByRepoKey.get(`${resolved.pr.repo.host}:${resolved.pr.repo.identity}`);
+    const changed = await submitReviewFlow({ pr: resolved.pr, client: resolved.client, ui: vscodePullRequestActionUi, logError: (m, e) => this.logger?.error(`Launchpad: ${m}`, e), myLogin }, decision);
+    if (changed) await this.refresh(false);
   }
 
-  private async submitReview(key: string, title: string, decision: ReviewSubmission): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    if (this.isOwnPullRequest(pr)) {
-      void vscode.window.showWarningMessage("GitLore: you can't review your own pull request.");
-      return;
-    }
-    const verb = decision === 'approve' ? 'Approve' : 'Request changes on';
-    const confirmed = await vscode.window.showWarningMessage(`${verb} "${title}" on ${pr.repo.label}?`, { modal: true }, verb);
-    if (confirmed !== verb) {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    try {
-      await client.submitReview(pr.repo, pr.number, decision);
-      await this.refresh(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger?.error(`Launchpad failed to submit a review for PR ${key}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't submit that review — ${message}`);
-    }
-  }
-
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the review flow directly, skipping only the modal. */
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the review flow with an auto-confirming UI. Now also exercises the self-review guard. */
   async submitReviewForTest(key: string, decision: ReviewSubmission): Promise<void> {
-    const pr = this.prsByKey.get(key);
-    if (!pr) {
-      return;
-    }
-    if (this.isOwnPullRequest(pr)) {
-      return;
-    }
-    const client = this.clientsByRepoKey.get(`${pr.repo.host}:${pr.repo.identity}`);
-    if (!client) {
-      return;
-    }
-    await client.submitReview(pr.repo, pr.number, decision);
-    await this.refresh(false);
+    const resolved = this.resolveActionCtx(key);
+    if (!resolved) return;
+    const myLogin = this.loginByRepoKey.get(`${resolved.pr.repo.host}:${resolved.pr.repo.identity}`);
+    const verb = decision === 'approve' ? 'Approve' : 'Request changes on';
+    const changed = await submitReviewFlow({ pr: resolved.pr, client: resolved.client, ui: autoConfirmUi(verb), logError: () => undefined, myLogin }, decision);
+    if (changed) await this.refresh(false);
   }
 }

@@ -11,7 +11,7 @@ import type {
   ReviewDecision,
   ReviewSubmission,
 } from './types';
-import { describeErrorBody } from './httpError';
+import { forgeFetch, ForgeHttpError, fetchAllPages, nextLinkFromHeader, mapWithConcurrency, sameLogin } from './forgeFetch';
 
 interface GitLabUser {
   username: string;
@@ -78,15 +78,10 @@ function computeCheckStatus(pipeline: GitLabPipeline | null | undefined): CheckS
 }
 
 /**
- * GitLab has no direct "changes requested" review state the way GitHub does — reviewers leave
- * comments/discussions instead. `blocking_discussions_resolved: false` (a required discussion
- * thread still open) is the closest real signal for "someone asked for something and it isn't
- * addressed yet", so that's what maps to `changesRequested` here.
+ * N4: GitLab has no "changes requested" review state — we derive the verdict from approvals only.
+ * Unresolved discussions are tracked separately (Phase B) and do not override a real approval.
  */
 function computeReviewDecision(mr: GitLabMergeRequest, approved: boolean, reviewers: string[]): ReviewDecision {
-  if (mr.blocking_discussions_resolved === false) {
-    return 'changesRequested';
-  }
   if (approved) {
     return 'approved';
   }
@@ -120,9 +115,15 @@ export class GitLabClient implements ForgeClient {
 
   async listOpenPullRequests(repo: ForgeRepoRef): Promise<PullRequestSummary[]> {
     const projectPath = encodeURIComponent(repo.identity);
-    const listRes = await this.request(`/projects/${projectPath}/merge_requests?state=opened&per_page=100`);
-    const raw = (await listRes.json()) as GitLabMergeRequest[];
-    return Promise.all(raw.map((mr) => this.enrich(repo, projectPath, mr)));
+    const raw = await fetchAllPages<GitLabMergeRequest>(
+      `/projects/${projectPath}/merge_requests?state=opened&per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitLabMergeRequest[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
+    return mapWithConcurrency(raw, 6, (mr) => this.enrich(repo, projectPath, mr));
   }
 
   /** Same shape as a `listOpenPullRequests` item — reuses `enrich` directly, no separate normalization path. */
@@ -307,7 +308,7 @@ export class GitLabClient implements ForgeClient {
     // GitHub's requested_reviewers semantics (per-person, not an all-or-nothing MR-level flag),
     // since someone else's approval satisfying the overall requirement doesn't mean *this*
     // reviewer weighed in.
-    const stillOwed = reviewers.filter((username) => !approvedByUsernames.has(username));
+    const stillOwed = reviewers.filter((username) => ![...approvedByUsernames].some((u) => sameLogin(u, username)));
     return {
       repo,
       number: mr.iid,
@@ -323,7 +324,7 @@ export class GitLabClient implements ForgeClient {
       // GitLab has no formal "request changes" state (see `submitReview`'s own comment on this) —
       // an approval is the only per-reviewer verdict its API exposes, so this shares the exact same
       // `approvedByUsernames` set `stillOwed` above already relies on, rather than a separate call.
-      reviewedByMe: approvedByUsernames.has(this.authenticatedUsername ?? ''),
+      reviewedByMe: [...approvedByUsernames].some((u) => sameLogin(u, this.authenticatedUsername)),
       hasConflicts: mr.has_conflicts ?? false,
     };
   }
@@ -339,32 +340,24 @@ export class GitLabClient implements ForgeClient {
 
   /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. Only `fetchApprovals` wraps this in `requestOrNull` — one MR's approval data failing to load shouldn't take down the whole list the way a credential problem on the list call itself should be visible. */
   private async request(path: string, init?: RequestInit): Promise<Response> {
-    const url = `${this.apiBaseUrl}${path}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        ...init,
-        headers: {
-          'PRIVATE-TOKEN': this.token,
-          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        },
-      });
-    } catch (err) {
-      throw new Error(`couldn't reach ${new URL(url).host}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (!res.ok) {
-      const detail = describeErrorBody(await res.text());
-      throw new Error(`${res.status} ${res.statusText} from ${new URL(url).host}${detail ? `: ${detail}` : ''}`);
-    }
-    return res;
+    const url = /^https?:\/\//.test(path) ? path : `${this.apiBaseUrl}${path}`;
+    const headers: Record<string, string> = {
+      'PRIVATE-TOKEN': this.token,
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...((init?.headers as Record<string, string>) ?? {}),
+    };
+    return forgeFetch(url, { ...init, headers }, { fetchImpl: this.fetchImpl });
   }
 
-  /** Network failure, DNS failure, non-2xx, etc. — degrade to "nothing here" rather than throwing partway through a board render. */
+  /** Only swallows 404s — other errors (auth failures, network, rate limits) propagate so the board can surface them correctly. */
   private async requestOrNull(path: string): Promise<Response | null> {
     try {
       return await this.request(path);
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
     }
   }
 }

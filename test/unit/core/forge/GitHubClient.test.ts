@@ -1,23 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GitHubClient } from '../../../../src/core/forge/GitHubClient';
+import { isCredentialRejection } from '../../../../src/core/forge/forgeFetch';
 import type { ForgeRepoRef } from '../../../../src/core/forge/types';
 
 const REPO: ForgeRepoRef = { host: 'github', identity: 'acme/widgets', label: 'acme/widgets' };
 const BASE = 'https://api.github.com';
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return {
-    ok,
+  return new Response(JSON.stringify(body), {
     status: ok ? 200 : 401,
     statusText: ok ? 'OK' : 'Unauthorized',
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  } as unknown as Response;
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function textResponse(body: string): Response {
-  return { ok: true, status: 200, statusText: 'OK', text: async () => body } as unknown as Response;
+  return new Response(body, { status: 200, statusText: 'OK' });
 }
 
 /** Routes a fake fetch by matching against the tail of the requested URL, so each test only wires up the endpoints it actually needs. */
@@ -47,6 +46,7 @@ test('listOpenPullRequests: normalizes a plain open PR with no reviews, checks, 
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/repos/acme/widgets/pulls?state=open&per_page=100': [
         {
           number: 1,
@@ -79,6 +79,7 @@ test('listOpenPullRequests: a requested reviewer who has not submitted a review 
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         {
           number: 2,
@@ -134,6 +135,7 @@ async function testReviewDecision(
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         {
           number: 3,
@@ -160,6 +162,7 @@ test('listOpenPullRequests: an in-progress check run -> checkStatus "pending", e
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         { number: 4, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', head: { sha: 'sha4' } },
       ],
@@ -182,6 +185,7 @@ test('listOpenPullRequests: all check runs completed and successful -> checkStat
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         { number: 5, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', head: { sha: 'sha5' } },
       ],
@@ -199,6 +203,7 @@ test('listOpenPullRequests: mergeable_state "dirty" -> hasConflicts true', async
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         { number: 6, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', head: { sha: 'sha6' } },
       ],
@@ -216,6 +221,7 @@ test('listOpenPullRequests: mergeable_state null (still computing) is treated as
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/pulls?state=open&per_page=100': [
         { number: 7, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', head: { sha: 'sha7' } },
       ],
@@ -233,13 +239,16 @@ test('listOpenPullRequests: a failed list request throws with the real status, n
   await assert.rejects(() => client.listOpenPullRequests(REPO), /401 Unauthorized from api\.github\.com/);
 });
 
-test('listOpenPullRequests: a network failure on an enrichment call degrades that field instead of throwing for the whole PR', async () => {
+test('listOpenPullRequests: a 404 on an enrichment endpoint degrades that field (endpoint absent) instead of throwing', async () => {
   const client = new GitHubClient(
     BASE,
     'tok',
     (async (url: string) => {
+      if (url === `${BASE}/user`) {
+        return jsonResponse({ login: 'raj' });
+      }
       if (url.includes('/check-runs')) {
-        throw new Error('network down');
+        return new Response('Not Found', { status: 404 });
       }
       if (url.endsWith('/pulls?state=open&per_page=100')) {
         return jsonResponse([
@@ -257,6 +266,50 @@ test('listOpenPullRequests: a network failure on an enrichment call degrades tha
   );
   const result = await client.listOpenPullRequests(REPO);
   assert.equal(result[0]?.checkStatus, 'none');
+});
+
+// ── A2-specific tests ─────────────────────────────────────────────────────
+
+test('A2: 401 from list endpoint throws ForgeHttpError with isCredentialRejection=true', async () => {
+  const client = new GitHubClient(BASE, 'bad', (async () => new Response('{}', { status: 401 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), true);
+      return true;
+    },
+  );
+});
+
+test('A2: 503 from list endpoint throws but isCredentialRejection=false (never clears credential on transient error)', async () => {
+  const client = new GitHubClient(BASE, 'tok', (async () => new Response('{}', { status: 503 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), false);
+      return true;
+    },
+  );
+});
+
+test('A2: caller-supplied Accept header wins over the default (raw-diff media type)', async () => {
+  let diffAccept = '';
+  let filesAccept = '';
+  // Already correct in GitHub — this test pins the header-merge contract
+  const client = new GitHubClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    const h = (init?.headers as Record<string, string>) ?? {};
+    if (url.includes('/files')) {
+      filesAccept = h['Accept'] ?? '';
+      return new Response(JSON.stringify([]), { status: 200, statusText: 'OK' });
+    }
+    diffAccept = h['Accept'] ?? '';
+    return new Response('diff text', { status: 200, statusText: 'OK' });
+  }) as typeof fetch);
+  // The diff endpoint passes Accept: application/vnd.github.v3.diff — it must not be overwritten
+  // by the default 'application/vnd.github+json'; and the files endpoint must still use the default.
+  await client.getPullRequestDiff(REPO, 1);
+  assert.equal(diffAccept, 'application/vnd.github.v3.diff');
+  assert.equal(filesAccept, 'application/vnd.github+json');
 });
 
 test('listOpenPullRequests: reviewedByMe is true when the authenticated user has a review on this PR, regardless of its state', async () => {
@@ -278,7 +331,7 @@ test('listOpenPullRequests: reviewedByMe is true when the authenticated user has
   assert.equal(result[0]?.reviewedByMe, true);
 });
 
-test('listOpenPullRequests: reviewedByMe is false when the authenticated user has not reviewed this PR yet', async () => {
+test('listOpenPullRequests: a non-mine PR not reviewed by the authenticated user is excluded from results entirely', async () => {
   const client = new GitHubClient(
     BASE,
     'tok',
@@ -287,14 +340,14 @@ test('listOpenPullRequests: reviewedByMe is false when the authenticated user ha
       '/pulls?state=open&per_page=100': [
         { number: 31, title: 'PR', html_url: 'u', user: { login: 'someone-else' }, created_at: 'c', updated_at: 'u', head: { sha: 'sha31' } },
       ],
+      // Slim path: only /reviews is fetched; 'raj' is not in it
       '/reviews?per_page=100': [{ user: { login: 'amy' }, state: 'APPROVED' }],
-      '/check-runs?per_page=100': { check_runs: [] },
-      '/pulls/31': { mergeable_state: 'clean' },
     }),
   );
   await client.getAuthenticatedLogin();
   const result = await client.listOpenPullRequests(REPO);
-  assert.equal(result[0]?.reviewedByMe, false);
+  // Under tiering, a non-mine unreviewed PR returns undefined and is filtered out
+  assert.equal(result.length, 0, 'non-mine unreviewed PR must not appear on board');
 });
 
 test('getPullRequest: fetches one PR by number and enriches it the same way the list endpoint does', async () => {
@@ -302,6 +355,7 @@ test('getPullRequest: fetches one PR by number and enriches it the same way the 
     BASE,
     'tok',
     fakeFetch({
+      '/user': { login: 'raj' },
       '/repos/acme/widgets/pulls/7': {
         number: 7,
         title: 'Single PR fetch',
@@ -622,7 +676,7 @@ test('mergePullRequest: deleteSourceBranch fetches the head ref and deletes it, 
         return jsonResponse({});
       }
       if (url.endsWith('/pulls/21')) {
-        return jsonResponse({ head: { ref: 'feature/x' } });
+        return jsonResponse({ head: { ref: 'feature/x', repo: { full_name: 'acme/widgets' } } });
       }
       if (url.endsWith('/git/refs/heads/feature%2Fx')) {
         return jsonResponse({});
@@ -687,4 +741,406 @@ test('createPullRequest: a rejected request throws with the real HTTP status', a
     () => client.createPullRequest(REPO, { title: 'x', base: 'main', compare: 'feature', draft: false }),
     /401 Unauthorized from api\.github\.com/,
   );
+});
+
+// ── A4: Pagination and bounded fan-out ─────────────────────────────────────
+
+function jsonResponseWithLink(body: unknown, nextUrl?: string): Response {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (nextUrl) {
+    headers['Link'] = `<${nextUrl}>; rel="next", <${nextUrl}>; rel="last"`;
+  }
+  return new Response(JSON.stringify(body), { status: 200, statusText: 'OK', headers });
+}
+
+test('A4: listOpenPullRequests follows Link header — 101 PRs across 2 pages all returned', async () => {
+  const page1Prs = Array.from({ length: 100 }, (_, i) => ({
+    number: i + 1,
+    title: `PR ${i + 1}`,
+    html_url: `https://github.com/acme/widgets/pull/${i + 1}`,
+    user: { login: 'alice' },
+    draft: false,
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+    requested_reviewers: [],
+    head: { sha: `sha${i + 1}` },
+  }));
+  const page2Prs = [{
+    number: 101,
+    title: 'PR 101',
+    html_url: 'https://github.com/acme/widgets/pull/101',
+    user: { login: 'alice' },
+    draft: false,
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+    requested_reviewers: [],
+    head: { sha: 'sha101' },
+  }];
+  const page2Url = `${BASE}/repos/acme/widgets/pulls?state=open&per_page=100&page=2`;
+
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'alice' });
+    if (url === `${BASE}/repos/acme/widgets/pulls?state=open&per_page=100`) {
+      return jsonResponseWithLink(page1Prs, page2Url);
+    }
+    if (url === page2Url) return jsonResponseWithLink(page2Prs);
+    // Enrich calls — return empty for speed
+    if (url.includes('/reviews')) return jsonResponseWithLink([]);
+    if (url.includes('/check-runs')) return jsonResponseWithLink({ check_runs: [] });
+    if (url.match(/\/pulls\/\d+$/) && !url.includes('/reviews')) return jsonResponse({ mergeable_state: 'clean' });
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 101, 'must return all 101 PRs across both pages');
+});
+
+test('A4: listOpenPullRequests stops at MAX_PAGES when Link next always present', async () => {
+  const { MAX_PAGES } = await import('../../../../src/core/forge/forgeFetch.js');
+  let callCount = 0;
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'alice' });
+    // Enrichment calls don't count toward page limit
+    if (url.includes('/reviews')) return jsonResponseWithLink([]);
+    if (url.includes('/check-runs')) return jsonResponseWithLink({ check_runs: [] });
+    if (url.match(/\/pulls\/\d+$/) && !url.includes('/reviews')) return jsonResponse({ mergeable_state: 'clean' });
+    // Always return 1 PR with a next link — infinite source
+    callCount++;
+    const nextUrl = `${BASE}/repos/acme/widgets/pulls?state=open&per_page=100&page=${callCount + 1}`;
+    return jsonResponseWithLink([{
+      number: callCount,
+      title: `PR ${callCount}`,
+      html_url: `https://github.com/acme/widgets/pull/${callCount}`,
+      user: { login: 'alice' },
+      draft: false,
+      created_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      requested_reviewers: [],
+      head: { sha: `sha${callCount}` },
+    }], nextUrl);
+  }) as typeof fetch);
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(callCount, MAX_PAGES, `should stop at MAX_PAGES (${MAX_PAGES}) list requests`);
+  assert.equal(result.length, MAX_PAGES, 'one PR per page');
+});
+
+test('A4: reviews are paginated — a review on page 2 is not lost', async () => {
+  const page2ReviewsUrl = `${BASE}/repos/acme/widgets/pulls/1/reviews?per_page=100&page=2`;
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'raj' });
+    if (url.endsWith('/pulls?state=open&per_page=100')) {
+      return jsonResponseWithLink([{
+        number: 1,
+        title: 'PR',
+        html_url: 'u',
+        user: { login: 'raj' },
+        draft: false,
+        created_at: 'c',
+        updated_at: 'u',
+        requested_reviewers: [],
+        head: { sha: 'sha1' },
+      }]);
+    }
+    if (url.endsWith('/pulls/1/reviews?per_page=100')) {
+      return jsonResponseWithLink(
+        [{ user: { login: 'amy' }, state: 'APPROVED' }],
+        page2ReviewsUrl,
+      );
+    }
+    if (url === page2ReviewsUrl) {
+      return jsonResponseWithLink([{ user: { login: 'bob' }, state: 'CHANGES_REQUESTED' }]);
+    }
+    if (url.includes('/check-runs')) return jsonResponseWithLink({ check_runs: [] });
+    if (url.endsWith('/pulls/1')) return jsonResponse({ mergeable_state: 'clean' });
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  // page 2 has CHANGES_REQUESTED — this must win (last state per user)
+  // bob's CHANGES_REQUESTED on page 2 should make reviewDecision changesRequested
+  assert.equal(result[0]?.reviewDecision, 'changesRequested', 'review from page 2 must not be lost');
+});
+
+test('A4: enrich fan-out is bounded — concurrent PR enrichments stay within limit', async () => {
+  // Track concurrent "enrich" operations by counting /reviews requests in-flight.
+  // Each enrich makes exactly one /reviews call, so this proxies enrich concurrency.
+  let concurrentEnrichs = 0;
+  let maxConcurrentEnrichs = 0;
+
+  const slowFetch = async (url: string | URL | Request) => {
+    const u = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+    if (u === `${BASE}/user`) return jsonResponse({ login: 'alice' });
+    if (u.endsWith('/pulls?state=open&per_page=100')) {
+      return jsonResponseWithLink(Array.from({ length: 20 }, (_, i) => ({
+        number: i + 1,
+        title: `PR ${i + 1}`,
+        html_url: `u${i}`,
+        user: { login: 'alice' },
+        draft: false,
+        created_at: 'c',
+        updated_at: 'u',
+        requested_reviewers: [],
+        head: { sha: `sha${i}` },
+      })));
+    }
+    // Count concurrent reviews calls as proxy for concurrent enrich operations
+    if (u.includes('/reviews')) {
+      concurrentEnrichs++;
+      maxConcurrentEnrichs = Math.max(maxConcurrentEnrichs, concurrentEnrichs);
+      await new Promise((r) => setTimeout(r, 10));
+      concurrentEnrichs--;
+      return jsonResponseWithLink([]);
+    }
+    if (u.includes('/check-runs')) return jsonResponseWithLink({ check_runs: [] });
+    return jsonResponse({ mergeable_state: 'clean' });
+  };
+  const client = new GitHubClient(BASE, 'tok', slowFetch as typeof fetch);
+  await client.getAuthenticatedLogin();
+  await client.listOpenPullRequests(REPO);
+  assert.ok(maxConcurrentEnrichs <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentEnrichs}`);
+  assert.ok(maxConcurrentEnrichs > 1, 'must use some concurrency (not fully serial)');
+});
+
+// ── A5: Normalization bugs ─────────────────────────────────────────────────
+
+test('A5 N1: a COMMENTED review after CHANGES_REQUESTED does not overwrite changesRequested', async () => {
+  const client = new GitHubClient(
+    BASE, 'tok',
+    fakeFetch({
+      '/user': { login: 'raj' },
+      '/pulls?state=open&per_page=100': [
+        { number: 50, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', requested_reviewers: [], head: { sha: 'sha50' } },
+      ],
+      '/reviews?per_page=100': [
+        { user: { login: 'amy' }, state: 'CHANGES_REQUESTED' },
+        { user: { login: 'amy' }, state: 'COMMENTED' },
+      ],
+      '/check-runs?per_page=100': { check_runs: [] },
+      '/pulls/50': { mergeable_state: 'clean' },
+    }),
+  );
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result[0]?.reviewDecision, 'changesRequested', 'COMMENTED must not overwrite prior CHANGES_REQUESTED');
+});
+
+test('A5 N1: a PENDING review after APPROVED does not overwrite approved', async () => {
+  const client = new GitHubClient(
+    BASE, 'tok',
+    fakeFetch({
+      '/user': { login: 'raj' },
+      '/pulls?state=open&per_page=100': [
+        { number: 51, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', requested_reviewers: [], head: { sha: 'sha51' } },
+      ],
+      '/reviews?per_page=100': [
+        { user: { login: 'amy' }, state: 'APPROVED' },
+        { user: { login: 'amy' }, state: 'PENDING' },
+      ],
+      '/check-runs?per_page=100': { check_runs: [] },
+      '/pulls/51': { mergeable_state: 'clean' },
+    }),
+  );
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result[0]?.reviewDecision, 'approved', 'PENDING must not overwrite prior APPROVED');
+});
+
+test('A5 N1: DISMISSED clears a prior verdict (no longer changesRequested)', async () => {
+  const client = new GitHubClient(
+    BASE, 'tok',
+    fakeFetch({
+      '/user': { login: 'raj' },
+      '/pulls?state=open&per_page=100': [
+        { number: 52, title: 'PR', html_url: 'u', user: { login: 'raj' }, created_at: 'c', updated_at: 'u', requested_reviewers: [], head: { sha: 'sha52' } },
+      ],
+      '/reviews?per_page=100': [
+        { user: { login: 'amy' }, state: 'CHANGES_REQUESTED' },
+        { user: { login: 'amy' }, state: 'DISMISSED' },
+      ],
+      '/check-runs?per_page=100': { check_runs: [] },
+      '/pulls/52': { mergeable_state: 'clean' },
+    }),
+  );
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result[0]?.reviewDecision, 'none', 'DISMISSED must clear prior CHANGES_REQUESTED');
+});
+
+test('A5 N2: approved + still-requested reviewer = approved (requestedReviewers must not override approval)', async () => {
+  const client = new GitHubClient(
+    BASE, 'tok',
+    fakeFetch({
+      '/user': { login: 'raj' },
+      '/pulls?state=open&per_page=100': [
+        {
+          number: 53,
+          title: 'PR',
+          html_url: 'u',
+          user: { login: 'raj' },
+          created_at: 'c',
+          updated_at: 'u',
+          requested_reviewers: [{ login: 'bob' }],
+          head: { sha: 'sha53' },
+        },
+      ],
+      '/reviews?per_page=100': [{ user: { login: 'amy' }, state: 'APPROVED' }],
+      '/check-runs?per_page=100': { check_runs: [] },
+      '/pulls/53': { mergeable_state: 'clean' },
+    }),
+  );
+  await client.getAuthenticatedLogin();
+  const result = await client.listOpenPullRequests(REPO);
+  // Amy approved, bob's review is still outstanding. Current bug: requestedReviewers wins over any approval.
+  // Fix: if approved and no CHANGES_REQUESTED, return approved regardless of requestedReviewers.
+  assert.equal(result[0]?.reviewDecision, 'approved', 'an approval must not be overridden by still-requested reviewers');
+});
+
+// ── A4 Step 4: GitHub review tiering ──────────────────────────────────────
+
+test('A4 Step 4: 50 PRs where 2 are mine → 2×3 + 48×1 = 54 enrichment requests', async () => {
+  let enrichmentRequests = 0;
+  const myPrNumbers = new Set([1, 2]); // PRs authored by 'raj'
+
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'raj' });
+    if (url.endsWith('/pulls?state=open&per_page=100')) {
+      return jsonResponseWithLink(Array.from({ length: 50 }, (_, i) => ({
+        number: i + 1,
+        title: `PR ${i + 1}`,
+        html_url: `u${i}`,
+        user: { login: myPrNumbers.has(i + 1) ? 'raj' : 'other' },
+        draft: false,
+        created_at: 'c',
+        updated_at: 'u',
+        requested_reviewers: [],
+        head: { sha: `sha${i}` },
+      })));
+    }
+    if (url.includes('/reviews')) { enrichmentRequests++; return jsonResponseWithLink([]); }
+    if (url.includes('/check-runs')) { enrichmentRequests++; return jsonResponseWithLink({ check_runs: [] }); }
+    // fetchMergeableState: /repos/acme/widgets/pulls/N (no trailing path)
+    if (/\/pulls\/\d+$/.test(url)) { enrichmentRequests++; return jsonResponse({ mergeable_state: 'clean' }); }
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+
+  const result = await client.listOpenPullRequests(REPO);
+  // 2 mine → 3 enrichment calls each = 6; 48 others → 1 review call each = 48; total = 54
+  assert.equal(enrichmentRequests, 54, `expected 54 enrichment requests, got ${enrichmentRequests}`);
+  // Only my 2 PRs; the 48 others have no 'raj' review → filtered out
+  assert.equal(result.length, 2, 'only the 2 authored-by-me PRs should appear');
+});
+
+test('A4 Step 4: a non-mine PR reviewed by me is included with reviewedByMe: true and slim fields', async () => {
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'raj' });
+    if (url.endsWith('/pulls?state=open&per_page=100')) {
+      return jsonResponseWithLink([{
+        number: 5,
+        title: 'Someone elses PR',
+        html_url: 'u5',
+        user: { login: 'alice' },
+        draft: false,
+        created_at: 'c',
+        updated_at: 'u',
+        requested_reviewers: [],
+        head: { sha: 'sha5' },
+      }]);
+    }
+    if (url.includes('/reviews')) {
+      return jsonResponseWithLink([{ user: { login: 'raj' }, state: 'APPROVED' }]);
+    }
+    // Slim path: check-runs and mergeable_state must NOT be fetched
+    throw new Error(`unmocked (slim path should not reach here): ${url}`);
+  }) as typeof fetch);
+
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 1);
+  assert.equal(result[0]?.reviewedByMe, true);
+  assert.equal(result[0]?.checkStatus, 'none', 'slim path sets checkStatus to none');
+  assert.equal(result[0]?.hasConflicts, false, 'slim path sets hasConflicts to false');
+  assert.equal(result[0]?.authorLogin, 'alice');
+});
+
+test('A4 Step 4: a non-mine PR NOT reviewed by me is excluded from results', async () => {
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) return jsonResponse({ login: 'raj' });
+    if (url.endsWith('/pulls?state=open&per_page=100')) {
+      return jsonResponseWithLink([{
+        number: 6, title: 'Not my PR', html_url: 'u6',
+        user: { login: 'alice' }, draft: false, created_at: 'c', updated_at: 'u',
+        requested_reviewers: [], head: { sha: 'sha6' },
+      }]);
+    }
+    if (url.includes('/reviews')) {
+      return jsonResponseWithLink([{ user: { login: 'bob' }, state: 'APPROVED' }]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 0, 'non-mine unreviewed PR must be excluded from results');
+});
+
+test('A4 Step 4: getPullRequest on a fresh client resolves login lazily and computes reviewedByMe', async () => {
+  // No prior call to getAuthenticatedLogin — ensureLogin() must set it transparently
+  const client = new GitHubClient(BASE, 'tok', fakeFetch({
+    '/user': { login: 'raj' },
+    '/repos/acme/widgets/pulls/9': {
+      number: 9, title: 'Fresh PR', html_url: 'u9',
+      user: { login: 'raj' }, draft: false, created_at: 'c', updated_at: 'u',
+      requested_reviewers: [], head: { sha: 'sha9' },
+    },
+    '/pulls/9/reviews?per_page=100': [{ user: { login: 'raj' }, state: 'APPROVED' }],
+    '/commits/sha9/check-runs?per_page=100': { check_runs: [] },
+    '/pulls/9': { mergeable_state: 'clean' },
+  }));
+  const result = await client.getPullRequest(REPO, 9);
+  assert.equal(result.number, 9);
+  assert.equal(result.reviewedByMe, true);
+});
+
+test('A4 Step 4: getAuthenticatedLogin is not called a second time when login is already cached', async () => {
+  let userFetchCount = 0;
+  const client = new GitHubClient(BASE, 'tok', (async (url: string) => {
+    if (url === `${BASE}/user`) { userFetchCount++; return jsonResponse({ login: 'raj' }); }
+    if (url.endsWith('/pulls?state=open&per_page=100')) return jsonResponseWithLink([]);
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+
+  await client.getAuthenticatedLogin(); // explicit first call
+  await client.listOpenPullRequests(REPO); // ensureLogin must NOT fetch /user again
+  assert.equal(userFetchCount, 1, 'getAuthenticatedLogin must not be called twice when login is already cached');
+});
+
+test('A5 N3: deleteSourceBranch on a fork PR with same-named branch does not delete the wrong branch', async () => {
+  const fetchedUrls: string[] = [];
+  const client = new GitHubClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    fetchedUrls.push(`${init?.method ?? 'GET'} ${url}`);
+    if (url.includes('/pulls/99') && !url.includes('/merge') && !url.includes('/reviews')) {
+      // Fork PR: head.repo is different from base repo
+      return jsonResponse({
+        number: 99,
+        title: 'Fork PR',
+        html_url: 'u',
+        user: { login: 'fork-user' },
+        draft: false,
+        created_at: 'c',
+        updated_at: 'u',
+        requested_reviewers: [],
+        head: { sha: 'sha99', ref: 'main', repo: { full_name: 'fork-user/widgets' } }, // fork repo
+        base: { ref: 'main', repo: { full_name: 'acme/widgets' } }, // base repo
+        merged_at: '2024-01-01T00:00:00Z',
+        merge_commit_sha: 'abc',
+        mergeable_state: 'clean',
+      });
+    }
+    if (url.includes('/pulls/99/merge')) {
+      return new Response(null, { status: 204, statusText: 'No Content' });
+    }
+    return jsonResponse({});
+  }) as typeof fetch);
+  await client.mergePullRequest(REPO, 99, { strategy: 'merge', deleteSourceBranch: true });
+  const deletedBranches = fetchedUrls.filter((u) => u.startsWith('DELETE') && u.includes('/git/refs/'));
+  assert.equal(deletedBranches.length, 0, 'must not delete a branch on the base repo when the PR is from a fork');
 });

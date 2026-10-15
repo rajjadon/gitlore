@@ -1,23 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BitbucketClient } from '../../../../src/core/forge/BitbucketClient';
+import { isCredentialRejection } from '../../../../src/core/forge/forgeFetch';
 import type { ForgeRepoRef } from '../../../../src/core/forge/types';
 
 const REPO: ForgeRepoRef = { host: 'bitbucket', identity: 'acme/widgets', label: 'acme/widgets' };
 const BASE = 'https://api.bitbucket.org/2.0';
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return {
-    ok,
+  return new Response(JSON.stringify(body), {
     status: ok ? 200 : 401,
     statusText: ok ? 'OK' : 'Unauthorized',
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  } as unknown as Response;
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function textResponse(body: string): Response {
-  return { ok: true, status: 200, statusText: 'OK', text: async () => body } as unknown as Response;
+  return new Response(body, { status: 200, statusText: 'OK' });
 }
 
 function fakeFetch(routes: Record<string, unknown>): typeof fetch {
@@ -51,7 +50,7 @@ test('listOpenPullRequests: normalizes a plain open PR with no reviewers or buil
     BASE,
     'tok',
     fakeFetch({
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 1,
@@ -80,7 +79,7 @@ test('listOpenPullRequests: a reviewer with state changes_requested -> reviewDec
     BASE,
     'tok',
     fakeFetch({
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 2,
@@ -107,7 +106,7 @@ test('listOpenPullRequests: an unapproved reviewer with no explicit state -> "re
     BASE,
     'tok',
     fakeFetch({
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 3,
@@ -134,7 +133,7 @@ test('listOpenPullRequests: every reviewer approved -> "approved", nobody left i
     BASE,
     'tok',
     fakeFetch({
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 4,
@@ -162,7 +161,7 @@ test('listOpenPullRequests: reviewedByMe is true when the authenticated user app
     'tok',
     fakeFetch({
       '/user': { username: 'raj' },
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 5,
@@ -190,7 +189,7 @@ test('listOpenPullRequests: reviewedByMe is true when the authenticated user req
     'tok',
     fakeFetch({
       '/user': { username: 'raj' },
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 6,
@@ -218,7 +217,7 @@ test('listOpenPullRequests: reviewedByMe is false for a REVIEWER who has not app
     'tok',
     fakeFetch({
       '/user': { username: 'raj' },
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 7,
@@ -245,7 +244,7 @@ test('listOpenPullRequests: a PARTICIPANT (not a REVIEWER) never counts toward r
     BASE,
     'tok',
     fakeFetch({
-      'pullrequests?state=OPEN': {
+      'pullrequests?state=OPEN&pagelen=50': {
         values: [
           {
             id: 5,
@@ -273,7 +272,7 @@ test('listOpenPullRequests: build status maps to checkStatus (SUCCESSFUL/FAILED/
       BASE,
       'tok',
       fakeFetch({
-        'pullrequests?state=OPEN': {
+        'pullrequests?state=OPEN&pagelen=50': {
           values: [
             { id: 6, title: 'PR', links: { html: { href: 'u' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha6' } } },
           ],
@@ -585,4 +584,96 @@ test('createPullRequest: draft throws a platform-gap error — Bitbucket Cloud h
     () => client.createPullRequest(REPO, { title: 'x', base: 'main', compare: 'feature', draft: true }),
     /Bitbucket Cloud has no draft pull requests/,
   );
+});
+
+// ── A2-specific tests ─────────────────────────────────────────────────────
+
+test('A2: 401 from list endpoint throws ForgeHttpError with isCredentialRejection=true', async () => {
+  const client = new BitbucketClient(BASE, 'bad', (async () => new Response('{}', { status: 401 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), true);
+      return true;
+    },
+  );
+});
+
+test('A2: 503 from list endpoint throws but isCredentialRejection=false', async () => {
+  const client = new BitbucketClient(BASE, 'tok', (async () => new Response('{}', { status: 503 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), false);
+      return true;
+    },
+  );
+});
+
+test('A2: Bitbucket: Authorization header always present in outgoing requests', async () => {
+  let capturedHeaders: Record<string, string> = {};
+  const client = new BitbucketClient(BASE, 'mytoken', (async (_url: string, init?: RequestInit) => {
+    capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+    return jsonResponse({ username: 'raj' });
+  }) as typeof fetch);
+  await client.getAuthenticatedLogin();
+  assert.equal(capturedHeaders['Authorization'], 'Bearer mytoken');
+});
+
+// ── A4: Pagination and bounded fan-out ─────────────────────────────────────
+
+function makeBbPr(id: number) {
+  return {
+    id,
+    title: `PR ${id}`,
+    links: { html: { href: `https://bitbucket.org/org/repo/pull-requests/${id}` } },
+    author: { account_id: `user-${id}`, nickname: 'alice', uuid: '{uuid-alice}' },
+    created_on: '2024-01-01T00:00:00.000000+00:00',
+    updated_on: '2024-01-01T00:00:00.000000+00:00',
+    source: { commit: { hash: `sha${id}` }, branch: { name: 'feature' }, repository: { full_name: 'org/repo' } },
+    destination: { branch: { name: 'main' }, repository: { full_name: 'org/repo' } },
+    participants: [],
+  };
+}
+
+test('A4: listOpenPullRequests follows body.next — 101 PRs across 2 pages all returned', async () => {
+  const page1 = Array.from({ length: 50 }, (_, i) => makeBbPr(i + 1));
+  const page2 = Array.from({ length: 51 }, (_, i) => makeBbPr(51 + i));
+  const page2Url = `${BASE}/repositories/org/repo/pullrequests?state=OPEN&pagelen=50&page=2`;
+
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/pullrequests?state=OPEN&pagelen=50') && !url.includes('page=2')) {
+      return new Response(JSON.stringify({ values: page1, next: page2Url }), { status: 200, statusText: 'OK', headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url === page2Url) {
+      return new Response(JSON.stringify({ values: page2 }), { status: 200, statusText: 'OK', headers: { 'Content-Type': 'application/json' } });
+    }
+    // Enrich calls
+    if (url.includes('/commit/') && url.includes('/statuses')) return jsonResponse({ values: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 101, 'must return all 101 PRs across both pages');
+});
+
+test('A4: enrich fan-out is bounded — concurrent enrichment calls stay within limit', async () => {
+  let concurrentEnrichs = 0;
+  let maxConcurrentEnrichs = 0;
+
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/pullrequests?state=OPEN&pagelen=50')) {
+      return new Response(JSON.stringify({ values: Array.from({ length: 20 }, (_, i) => makeBbPr(i + 1)) }), { status: 200, statusText: 'OK', headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('/commit/') && url.includes('/statuses')) {
+      concurrentEnrichs++;
+      maxConcurrentEnrichs = Math.max(maxConcurrentEnrichs, concurrentEnrichs);
+      await new Promise((r) => setTimeout(r, 10));
+      concurrentEnrichs--;
+      return jsonResponse({ values: [] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  await client.listOpenPullRequests(REPO);
+  assert.ok(maxConcurrentEnrichs <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentEnrichs}`);
+  assert.ok(maxConcurrentEnrichs > 1, 'must use some concurrency (not fully serial)');
 });

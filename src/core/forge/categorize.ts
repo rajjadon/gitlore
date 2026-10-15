@@ -1,4 +1,5 @@
 import type { CategorizedPullRequest, LaunchpadBucket, PullRequestSummary } from './types';
+import { sameLogin } from './forgeFetch';
 
 function bucketFor(pr: PullRequestSummary, myLogin: string, snoozed: boolean): LaunchpadBucket {
   if (snoozed) {
@@ -14,7 +15,7 @@ function bucketFor(pr: PullRequestSummary, myLogin: string, snoozed: boolean): L
   // conflict appears, another reviewer requests changes), UNLESS the host has put you back in
   // requestedReviewers — a fresh re-request after your earlier review is a more urgent, more
   // actionable signal than "already reviewed", so that still routes through the checks below.
-  if (pr.authorLogin !== myLogin && pr.reviewedByMe && !pr.requestedReviewers.includes(myLogin)) {
+  if (!sameLogin(pr.authorLogin, myLogin) && pr.reviewedByMe && !pr.requestedReviewers.some((r) => sameLogin(r, myLogin))) {
     return 'reviewed';
   }
   if (pr.checkStatus === 'failing' || pr.reviewDecision === 'changesRequested' || pr.hasConflicts) {
@@ -22,7 +23,7 @@ function bucketFor(pr: PullRequestSummary, myLogin: string, snoozed: boolean): L
   }
   // Still in requestedReviewers means I haven't submitted a review yet — GitHub (and the other
   // hosts, normalized the same way) removes a reviewer from this list the moment they do.
-  if (pr.requestedReviewers.includes(myLogin)) {
+  if (pr.requestedReviewers.some((r) => sameLogin(r, myLogin))) {
     return 'needsReview';
   }
   if (pr.reviewDecision === 'approved' && pr.checkStatus !== 'pending' && !pr.hasConflicts) {
@@ -49,7 +50,7 @@ export function categorizePullRequests(
 ): CategorizedPullRequest[] {
   return pullRequests
     .filter(
-      (pr) => pr.authorLogin === currentUserLogin || pr.requestedReviewers.includes(currentUserLogin) || pr.reviewedByMe,
+      (pr) => sameLogin(pr.authorLogin, currentUserLogin) || pr.requestedReviewers.some((r) => sameLogin(r, currentUserLogin)) || pr.reviewedByMe,
     )
     .map((pr) => ({ pr, bucket: bucketFor(pr, currentUserLogin, isSnoozed(pr)) }));
 }
@@ -64,6 +65,6 @@ export function categorizePullRequests(
  */
 export function categorizeClosedPullRequests(pullRequests: PullRequestSummary[], currentUserLogin: string): CategorizedPullRequest[] {
   return pullRequests
-    .filter((pr) => pr.authorLogin === currentUserLogin)
+    .filter((pr) => sameLogin(pr.authorLogin, currentUserLogin))
     .map((pr) => ({ pr, bucket: pr.merged ? 'merged' : 'closed' }));
 }

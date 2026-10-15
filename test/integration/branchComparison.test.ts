@@ -154,9 +154,8 @@ suite('Branch comparison webview', () => {
       api.branchComparisonViewProvider.setFetchImplForTest((async (url: string, init?: RequestInit) => {
         if (url.endsWith('/repos/acme/created-widgets/pulls') && init?.method === 'POST') {
           capturedBody = init.body as string;
-          return {
-            ok: true,
-            json: async () => ({
+          return new Response(
+            JSON.stringify({
               number: 99,
               title: 'Add feature line',
               html_url: 'https://github.com/acme/created-widgets/pull/99',
@@ -165,7 +164,8 @@ suite('Branch comparison webview', () => {
               created_at: '2024-01-01T00:00:00Z',
               updated_at: '2024-01-01T00:00:00Z',
             }),
-          } as unknown as Response;
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
         }
         throw new Error(`unmocked request in test: ${url}`);
       }) as unknown as typeof fetch);
@@ -202,7 +202,7 @@ suite('Branch comparison webview', () => {
     let calledNetwork = false;
     api.branchComparisonViewProvider.setFetchImplForTest((async () => {
       calledNetwork = true;
-      return { ok: true, json: async () => ({}) } as unknown as Response;
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
     }) as unknown as typeof fetch);
 
     await api.branchComparisonViewProvider.createPullRequestForTest('Add feature line', false);

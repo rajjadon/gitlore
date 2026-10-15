@@ -11,8 +11,9 @@ import type { GitLogger } from '../../core/git/errors';
 import { runCommitSummaryFlow } from '../../core/ai/commitSummaryFlow';
 import { buildPrExplanationPrompt, buildPrReviewDraftPrompt } from '../../core/ai/prompts';
 import { describeNoModelReason } from '../../core/ai/modelAvailability';
-import { pickMergeStrategy } from '../mergeStrategyPicker';
 import { CONFIG, MEDIA, VIEWS } from '../../constants';
+import { closePullRequestFlow, mergePullRequestFlow, reopenPullRequestFlow, submitReviewFlow } from '../pullRequestActions';
+import { vscodePullRequestActionUi } from '../pullRequestActionUi';
 
 function createNonce(): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -201,133 +202,117 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     await this.resolveThread(this.currentPr, this.currentClient, threadId);
   }
 
-  private async closePullRequest(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
-    const confirmed = await vscode.window.showWarningMessage(
-      `Close "${pr.title}"? This closes it on ${pr.repo.label} without merging.`,
-      { modal: true },
-      'Close PR',
-    );
-    if (confirmed !== 'Close PR') {
-      return;
-    }
+  /** After a successful action, refetch and re-render. On failure, posts `actionFailed` so the webview can reset its busy state. */
+  private async reloadAfterAction(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
     try {
-      await client.closePullRequest(pr.repo, pr.number);
       const refreshed = await client.getPullRequest(pr.repo, pr.number);
       await this.load(refreshed, client);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`PR Details failed to close PR #${pr.number}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't close the PR — ${message}`);
       void this.view?.webview.postMessage({ type: 'actionFailed' });
+      this.logger.error(`PR Details failed to refresh PR #${pr.number} after action`, err);
     }
   }
 
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the close flow directly, skipping only the modal. */
+  private async closePullRequest(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
+    const changed = await closePullRequestFlow({
+      pr, client, ui: vscodePullRequestActionUi,
+      logError: (m, e) => { this.logger.error(`PR Details: ${m}`, e); void this.view?.webview.postMessage({ type: 'actionFailed' }); },
+    });
+    if (changed) await this.reloadAfterAction(pr, client);
+  }
+
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the close flow with an auto-confirming UI. Now also exercises real flow logic. */
   async closePullRequestForTest(): Promise<void> {
-    if (!this.currentPr || !this.currentClient) {
-      return;
+    if (!this.currentPr || !this.currentClient) return;
+    const changed = await closePullRequestFlow({
+      pr: this.currentPr, client: this.currentClient,
+      ui: { async confirm(_m, ...b) { return b[0]; }, async pickMergeStrategy() { return undefined; }, warn() {}, error() {} },
+      logError: () => undefined,
+    });
+    if (changed) {
+      const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
+      await this.load(refreshed, this.currentClient);
     }
-    await this.currentClient.closePullRequest(this.currentPr.repo, this.currentPr.number);
-    const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
-    await this.load(refreshed, this.currentClient);
   }
 
   private async reopenPullRequest(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
-    const confirmed = await vscode.window.showWarningMessage(`Reopen "${pr.title}" on ${pr.repo.label}?`, { modal: true }, 'Reopen PR');
-    if (confirmed !== 'Reopen PR') {
-      return;
-    }
-    try {
-      await client.reopenPullRequest(pr.repo, pr.number);
-      const refreshed = await client.getPullRequest(pr.repo, pr.number);
-      await this.load(refreshed, client);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`PR Details failed to reopen PR #${pr.number}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't reopen the PR — ${message}`);
-      void this.view?.webview.postMessage({ type: 'actionFailed' });
-    }
+    const changed = await reopenPullRequestFlow({
+      pr, client, ui: vscodePullRequestActionUi,
+      logError: (m, e) => { this.logger.error(`PR Details: ${m}`, e); void this.view?.webview.postMessage({ type: 'actionFailed' }); },
+    });
+    if (changed) await this.reloadAfterAction(pr, client);
   }
 
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the reopen flow directly, skipping only the modal. */
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the reopen flow with an auto-confirming UI. */
   async reopenPullRequestForTest(): Promise<void> {
-    if (!this.currentPr || !this.currentClient) {
-      return;
+    if (!this.currentPr || !this.currentClient) return;
+    const changed = await reopenPullRequestFlow({
+      pr: this.currentPr, client: this.currentClient,
+      ui: { async confirm(_m, ...b) { return b[0]; }, async pickMergeStrategy() { return undefined; }, warn() {}, error() {} },
+      logError: () => undefined,
+    });
+    if (changed) {
+      const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
+      await this.load(refreshed, this.currentClient);
     }
-    await this.currentClient.reopenPullRequest(this.currentPr.repo, this.currentPr.number);
-    const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
-    await this.load(refreshed, this.currentClient);
   }
 
   /** A QuickPick for the strategy (filtered to what this PR's host actually supports), then one modal confirm with two buttons — "Merge" and "Merge & Delete Branch" — matching Launchpad's card Merge action exactly. */
   private async mergePullRequest(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
-    const strategy = await pickMergeStrategy(pr);
-    if (!strategy) {
-      return;
-    }
-    const confirmed = await vscode.window.showWarningMessage(
-      `Merge "${pr.title}" on ${pr.repo.label}? This can't be undone.`,
-      { modal: true },
-      'Merge',
-      'Merge & Delete Branch',
-    );
-    if (confirmed !== 'Merge' && confirmed !== 'Merge & Delete Branch') {
-      return;
-    }
-    try {
-      await client.mergePullRequest(pr.repo, pr.number, { strategy, deleteSourceBranch: confirmed === 'Merge & Delete Branch' });
-      const refreshed = await client.getPullRequest(pr.repo, pr.number);
-      await this.load(refreshed, client);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`PR Details failed to merge PR #${pr.number}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't merge the PR — ${message}`);
-      void this.view?.webview.postMessage({ type: 'actionFailed' });
-    }
+    const changed = await mergePullRequestFlow({
+      pr, client, ui: vscodePullRequestActionUi,
+      logError: (m, e) => { this.logger.error(`PR Details: ${m}`, e); void this.view?.webview.postMessage({ type: 'actionFailed' }); },
+    });
+    if (changed) await this.reloadAfterAction(pr, client);
   }
 
-  /** Test-only introspection seam — the merge QuickPick and confirmation modal can't be driven from an integration test, so this calls the merge flow directly with a fixed strategy/delete choice, skipping both prompts. */
+  /** Test-only introspection seam — the merge QuickPick and confirmation modal can't be driven from an integration test, so this calls the merge flow with a fixed strategy/delete choice. */
   async mergePullRequestForTest(strategy: MergeStrategy, deleteSourceBranch: boolean): Promise<void> {
-    if (!this.currentPr || !this.currentClient) {
-      return;
+    if (!this.currentPr || !this.currentClient) return;
+    const changed = await mergePullRequestFlow({
+      pr: this.currentPr, client: this.currentClient,
+      ui: {
+        async confirm(_m, ...b) { return b.find((btn) => btn === (deleteSourceBranch ? 'Merge & Delete Branch' : 'Merge')); },
+        async pickMergeStrategy() { return strategy; },
+        warn() {}, error() {},
+      },
+      logError: () => undefined,
+    });
+    if (changed) {
+      const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
+      await this.load(refreshed, this.currentClient);
     }
-    await this.currentClient.mergePullRequest(this.currentPr.repo, this.currentPr.number, { strategy, deleteSourceBranch });
-    const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
-    await this.load(refreshed, this.currentClient);
   }
 
-  /** Every host we support rejects a review from the PR's own author one way or another — checked live via `getAuthenticatedLogin` rather than a cached map, since this panel only ever shows one PR at a time (unlike Launchpad's board, which caches a login per repo across many cards to avoid re-checking on every render). */
+  /**
+   * `getAuthenticatedLogin` is called live each time (not cached) — the panel only shows one PR at
+   * a time, so the overhead is negligible, and it's more accurate than a stale cached value.
+   */
   private async submitReview(pr: PullRequestSummary, client: ForgeClient, decision: ReviewSubmission): Promise<void> {
     const login = await client.getAuthenticatedLogin();
-    if (login && pr.authorLogin.toLowerCase() === login.toLowerCase()) {
-      void vscode.window.showWarningMessage("GitLore: you can't review your own pull request.");
-      return;
-    }
-    const verb = decision === 'approve' ? 'Approve' : 'Request changes on';
-    const confirmed = await vscode.window.showWarningMessage(`${verb} "${pr.title}" on ${pr.repo.label}?`, { modal: true }, verb);
-    if (confirmed !== verb) {
-      return;
-    }
-    try {
-      await client.submitReview(pr.repo, pr.number, decision);
-      const refreshed = await client.getPullRequest(pr.repo, pr.number);
-      await this.load(refreshed, client);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`PR Details failed to submit a review for PR #${pr.number}`, err);
-      void vscode.window.showErrorMessage(`GitLore: couldn't submit that review — ${message}`);
-      void this.view?.webview.postMessage({ type: 'actionFailed' });
-    }
+    const changed = await submitReviewFlow({
+      pr, client, ui: vscodePullRequestActionUi,
+      logError: (m, e) => { this.logger.error(`PR Details: ${m}`, e); void this.view?.webview.postMessage({ type: 'actionFailed' }); },
+      myLogin: login ?? undefined,
+    }, decision);
+    if (changed) await this.reloadAfterAction(pr, client);
   }
 
-  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the review flow directly, skipping only the modal and the self-review check. */
+  /** Test-only introspection seam — a webview button click (and the real confirmation modal it triggers) can't be driven from an integration test, so this calls the review flow with an auto-confirming UI. Now also exercises the self-review guard. */
   async submitReviewForTest(decision: ReviewSubmission): Promise<void> {
-    if (!this.currentPr || !this.currentClient) {
-      return;
+    if (!this.currentPr || !this.currentClient) return;
+    const login = await this.currentClient.getAuthenticatedLogin();
+    const verb = decision === 'approve' ? 'Approve' : 'Request changes on';
+    const changed = await submitReviewFlow({
+      pr: this.currentPr, client: this.currentClient,
+      ui: { async confirm(_m, ...b) { return b.find((btn) => btn === verb); }, async pickMergeStrategy() { return undefined; }, warn() {}, error() {} },
+      logError: () => undefined,
+      myLogin: login ?? undefined,
+    }, decision);
+    if (changed) {
+      const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
+      await this.load(refreshed, this.currentClient);
     }
-    await this.currentClient.submitReview(this.currentPr.repo, this.currentPr.number, decision);
-    const refreshed = await this.currentClient.getPullRequest(this.currentPr.repo, this.currentPr.number);
-    await this.load(refreshed, this.currentClient);
   }
 
   private async addComment(pr: PullRequestSummary, client: ForgeClient, body: string): Promise<void> {

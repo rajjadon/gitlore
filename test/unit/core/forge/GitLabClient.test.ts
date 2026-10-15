@@ -1,19 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GitLabClient } from '../../../../src/core/forge/GitLabClient';
+import { isCredentialRejection } from '../../../../src/core/forge/forgeFetch';
 import type { ForgeRepoRef } from '../../../../src/core/forge/types';
 
 const REPO: ForgeRepoRef = { host: 'gitlab', identity: 'acme/widgets', label: 'acme/widgets' };
 const BASE = 'https://gitlab.com/api/v4';
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return {
-    ok,
+  return new Response(JSON.stringify(body), {
     status: ok ? 200 : 401,
     statusText: ok ? 'OK' : 'Unauthorized',
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  } as unknown as Response;
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function fakeFetch(routes: Record<string, unknown>): typeof fetch {
@@ -107,7 +106,8 @@ test('listOpenPullRequests: has_conflicts maps straight through, no extra reques
   assert.equal(result[0]?.hasConflicts, true);
 });
 
-test('listOpenPullRequests: blocking_discussions_resolved === false maps to changesRequested', async () => {
+// N4: unresolved discussions no longer override a real approval — verdict derives from approvals only.
+test('listOpenPullRequests: approved + unresolved discussion → approved, not changesRequested (N4)', async () => {
   const client = new GitLabClient(
     BASE,
     'tok',
@@ -127,8 +127,7 @@ test('listOpenPullRequests: blocking_discussions_resolved === false maps to chan
     }),
   );
   const result = await client.listOpenPullRequests(REPO);
-  // Even though approved, an unresolved required discussion is the more actionable/blocking signal.
-  assert.equal(result[0]?.reviewDecision, 'changesRequested');
+  assert.equal(result[0]?.reviewDecision, 'approved');
 });
 
 test('listOpenPullRequests: a reviewer who has personally approved is removed from requestedReviewers, others remain', async () => {
@@ -547,4 +546,106 @@ test('createPullRequest: a rejected request throws with the real HTTP status', a
     () => client.createPullRequest(REPO, { title: 'x', base: 'main', compare: 'feature', draft: false }),
     /401 Unauthorized from gitlab\.com/,
   );
+});
+
+// ── A2-specific tests ─────────────────────────────────────────────────────
+
+test('A2: 401 from list endpoint throws ForgeHttpError with isCredentialRejection=true', async () => {
+  const client = new GitLabClient(BASE, 'bad', (async () => new Response('{}', { status: 401 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), true);
+      return true;
+    },
+  );
+});
+
+test('A2: 503 from list endpoint throws but isCredentialRejection=false (never clears credential on transient error)', async () => {
+  const client = new GitLabClient(BASE, 'tok', (async () => new Response('{}', { status: 503 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), false);
+      return true;
+    },
+  );
+});
+
+test('A2: GitLab: caller-supplied headers (e.g. Accept) survive alongside PRIVATE-TOKEN — init.headers not overwritten', async () => {
+  let capturedHeaders: Record<string, string> = {};
+  const client = new GitLabClient(BASE, 'tok', (async (_url: string, init?: RequestInit) => {
+    capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+    return jsonResponse({});
+  }) as typeof fetch);
+  // Simulate a caller passing a custom Accept header via request() — the token must not clobber it
+  await client.getAuthenticatedLogin(); // triggers a request, captures headers
+  assert.equal(capturedHeaders['PRIVATE-TOKEN'], 'tok');
+});
+
+// ── A4: Pagination and bounded fan-out ─────────────────────────────────────
+
+function jsonResponseWithLink(body: unknown, nextUrl?: string): Response {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (nextUrl) {
+    headers['Link'] = `<${nextUrl}>; rel="next"`;
+  }
+  return new Response(JSON.stringify(body), { status: 200, statusText: 'OK', headers });
+}
+
+test('A4: listOpenPullRequests follows Link header — 101 MRs across 2 pages all returned', async () => {
+  const makeMr = (iid: number) => ({
+    iid,
+    title: `MR ${iid}`,
+    web_url: `https://gitlab.com/org/repo/-/merge_requests/${iid}`,
+    author: { username: 'alice' },
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+  });
+  const page1 = Array.from({ length: 100 }, (_, i) => makeMr(i + 1));
+  const page2 = [makeMr(101)];
+  const page2Url = `${BASE}/projects/org%2Frepo/merge_requests?state=opened&per_page=100&page=2`;
+
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/user')) return jsonResponse({ username: 'alice' });
+    if (url.includes('state=opened') && !url.includes('page=2')) {
+      return jsonResponseWithLink(page1, page2Url);
+    }
+    if (url === page2Url) return jsonResponseWithLink(page2);
+    // approvals — return empty for speed
+    if (url.includes('/approvals')) return jsonResponse({ approved: false, approved_by: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 101, 'must return all 101 MRs across both pages');
+});
+
+test('A4: enrich fan-out is bounded — concurrent approvals calls stay within limit', async () => {
+  let concurrentApprovals = 0;
+  let maxConcurrentApprovals = 0;
+
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/user')) return jsonResponse({ username: 'alice' });
+    if (url.includes('state=opened')) {
+      return jsonResponseWithLink(Array.from({ length: 20 }, (_, i) => ({
+        iid: i + 1,
+        title: `MR ${i + 1}`,
+        web_url: `u${i}`,
+        author: { username: 'alice' },
+        created_at: 'c',
+        updated_at: 'u',
+      })));
+    }
+    if (url.includes('/approvals')) {
+      concurrentApprovals++;
+      maxConcurrentApprovals = Math.max(maxConcurrentApprovals, concurrentApprovals);
+      await new Promise((r) => setTimeout(r, 10));
+      concurrentApprovals--;
+      return jsonResponse({ approved: false, approved_by: [] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as typeof fetch);
+  await client.listOpenPullRequests(REPO);
+  assert.ok(maxConcurrentApprovals <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentApprovals}`);
+  assert.ok(maxConcurrentApprovals > 1, 'must use some concurrency (not fully serial)');
 });

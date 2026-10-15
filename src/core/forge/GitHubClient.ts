@@ -11,7 +11,7 @@ import type {
   ReviewDecision,
   ReviewSubmission,
 } from './types';
-import { describeErrorBody } from './httpError';
+import { forgeFetch, ForgeHttpError, fetchAllPages, nextLinkFromHeader, mapWithConcurrency, sameLogin } from './forgeFetch';
 
 /** Fetches up to 100 review threads and each one's first comment — enough to identify and resolve a conversation without paginating replies nobody asked to see. */
 const REVIEW_THREADS_QUERY = `
@@ -103,14 +103,23 @@ interface GitHubPullFile {
   patch?: string;
 }
 
-/** Last review per user wins — GitHub returns reviews in submission order, so the last occurrence for a given login is their current standing. */
+/**
+ * Last *decisive* review per user wins. GitHub returns reviews in submission order.
+ * COMMENTED and PENDING don't express a verdict — they must not overwrite an existing
+ * APPROVED or CHANGES_REQUESTED (N1). DISMISSED means the host invalidated a prior verdict
+ * (e.g. a force-push) — remove that user's entry entirely so they're no longer counted.
+ */
 function latestReviewPerUser(reviews: GitHubReview[]): GitHubReview[] {
   const byUser = new Map<string, GitHubReview>();
   for (const review of reviews) {
     const login = review.user?.login;
-    if (login) {
+    if (!login) continue;
+    if (review.state === 'DISMISSED') {
+      byUser.delete(login);
+    } else if (review.state !== 'COMMENTED' && review.state !== 'PENDING') {
       byUser.set(login, review);
     }
+    // COMMENTED/PENDING: deliberately skip — must not overwrite a real verdict
   }
   return [...byUser.values()];
 }
@@ -120,18 +129,26 @@ function computeReviewDecision(reviews: GitHubReview[], requestedReviewers: stri
   if (latest.some((r) => r.state === 'CHANGES_REQUESTED')) {
     return 'changesRequested';
   }
-  if (requestedReviewers.length > 0) {
-    return 'reviewRequired';
-  }
+  // An approval from any reviewer is a real signal — requestedReviewers just tracks who's *still
+  // owed* one, not whether the PR is in a bad state. An existing approval must not be buried
+  // under a "more reviews needed" label (N2). reviewRequired only when nobody has approved yet.
   if (latest.some((r) => r.state === 'APPROVED')) {
     return 'approved';
+  }
+  if (requestedReviewers.length > 0) {
+    return 'reviewRequired';
   }
   return 'none';
 }
 
-/** Any review state (approve, request-changes, or a plain comment-only review) counts — this is about whether *this specific person* has acted, independent of the PR's overall `reviewDecision`. */
+/**
+ * Any non-DISMISSED review state counts — a COMMENTED-only review means the user engaged with the
+ * PR, so it belongs in "Reviewed" on the board. We use the raw list (not latestReviewPerUser) so
+ * a COMMENTED review left after a DISMISSED verdict still marks the PR as reviewed. DISMISSED means
+ * the host invalidated a prior verdict, but the user still acted, so it counts for `reviewedByMe`.
+ */
 function computeReviewedByMe(reviews: GitHubReview[], myLogin: string | undefined): boolean {
-  return !!myLogin && latestReviewPerUser(reviews).some((r) => r.user?.login === myLogin);
+  return reviews.some((r) => sameLogin(r.user?.login, myLogin));
 }
 
 const FAILING_CONCLUSIONS = new Set(['failure', 'timed_out', 'cancelled', 'action_required']);
@@ -173,13 +190,22 @@ export class GitHubClient implements ForgeClient {
   }
 
   async listOpenPullRequests(repo: ForgeRepoRef): Promise<PullRequestSummary[]> {
-    const listRes = await this.request(`/repos/${repo.identity}/pulls?state=open&per_page=100`);
-    const raw = (await listRes.json()) as GitHubPull[];
-    return Promise.all(raw.map((pull) => this.enrich(repo, pull)));
+    const myLogin = await this.ensureLogin();
+    const raw = await fetchAllPages<GitHubPull>(
+      `/repos/${repo.identity}/pulls?state=open&per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitHubPull[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
+    const enriched = await mapWithConcurrency(raw, 6, (pull) => this.enrichTiered(repo, pull, myLogin));
+    return enriched.filter((r): r is PullRequestSummary => r !== undefined);
   }
 
   /** Same shape as a `listOpenPullRequests` item — reuses `enrich` directly, no separate normalization path. */
   async getPullRequest(repo: ForgeRepoRef, number: number): Promise<PullRequestSummary> {
+    await this.ensureLogin();
     const res = await this.request(`/repos/${repo.identity}/pulls/${number}`);
     const pull = (await res.json()) as GitHubPull;
     return this.enrich(repo, pull);
@@ -193,8 +219,14 @@ export class GitHubClient implements ForgeClient {
     // multi-repo board refreshing repeatedly could burn through fast — `per_page=100` (the max)
     // is the safer mitigation for the same "your own older PRs got pushed out of the window"
     // truncation risk, even though it's not a complete server-side fix the way the other hosts get.
-    const listRes = await this.request(`/repos/${repo.identity}/pulls?state=closed&sort=updated&direction=desc&per_page=100`);
-    const raw = (await listRes.json()) as GitHubClosedPull[];
+    const raw = await fetchAllPages<GitHubClosedPull>(
+      `/repos/${repo.identity}/pulls?state=closed&sort=updated&direction=desc&per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitHubClosedPull[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
     return raw.map((pull) => ({
       repo,
       number: pull.number,
@@ -295,9 +327,12 @@ export class GitHubClient implements ForgeClient {
       body: JSON.stringify({ merge_method: options.strategy }),
     });
     if (options.deleteSourceBranch) {
-      const branch = await this.fetchHeadBranch(repo, number);
-      if (branch) {
-        await this.request(`/repos/${repo.identity}/git/refs/heads/${encodeURIComponent(branch)}`, { method: 'DELETE' });
+      const headInfo = await this.fetchHeadBranch(repo, number);
+      // N3: only delete the branch on the base repo. A fork PR's head.repo is the fork, not the
+      // base — deleting `refs/heads/feature` on the base repo when the PR came from a fork
+      // that happens to have the same branch name would delete an unrelated branch.
+      if (headInfo && headInfo.repoFullName === repo.identity) {
+        await this.request(`/repos/${repo.identity}/git/refs/heads/${encodeURIComponent(headInfo.ref)}`, { method: 'DELETE' });
       }
     }
   }
@@ -326,14 +361,65 @@ export class GitHubClient implements ForgeClient {
     };
   }
 
-  /** Best-effort: if this fails, the merge itself already succeeded, so the caller just keeps the source branch around rather than failing an otherwise-successful merge over branch cleanup. */
-  private async fetchHeadBranch(repo: ForgeRepoRef, number: number): Promise<string | undefined> {
-    const res = await this.requestOrNull(`/repos/${repo.identity}/pulls/${number}`);
-    if (!res) {
+  /** Best-effort: if this fails, the merge itself already succeeded, so the caller just keeps the source branch around rather than failing an otherwise-successful merge over branch cleanup. Returns both the ref name and the head repo's full_name so the caller can guard against cross-fork branch deletion (N3). */
+  private async fetchHeadBranch(repo: ForgeRepoRef, number: number): Promise<{ ref: string; repoFullName: string } | undefined> {
+    try {
+      const res = await this.request(`/repos/${repo.identity}/pulls/${number}`);
+      const data = (await res.json()) as { head?: { ref?: string; repo?: { full_name?: string } } };
+      const ref = data.head?.ref;
+      const repoFullName = data.head?.repo?.full_name;
+      if (!ref || !repoFullName) return undefined;
+      return { ref, repoFullName };
+    } catch {
       return undefined;
     }
-    const data = (await res.json()) as { head?: { ref?: string } };
-    return data.head?.ref;
+  }
+
+  /** Calls `getAuthenticatedLogin()` once and caches the result — safe to call from both
+   *  `listOpenPullRequests` and `getPullRequest` so both get a correct `reviewedByMe`. */
+  private async ensureLogin(): Promise<string | undefined> {
+    if (!this.authenticatedLogin) {
+      await this.getAuthenticatedLogin();
+    }
+    return this.authenticatedLogin;
+  }
+
+  /**
+   * Tiered enrichment — reduces API calls for PRs where the authenticated user has no stake:
+   * - PRs authored by me, or where I'm a requested reviewer → full `enrich` (3 calls)
+   * - All other PRs → reviews only (1 call); if not `reviewedByMe`, excluded from results entirely
+   */
+  private async enrichTiered(
+    repo: ForgeRepoRef,
+    pull: GitHubPull,
+    myLogin: string | undefined,
+  ): Promise<PullRequestSummary | undefined> {
+    const requestedReviewers = (pull.requested_reviewers ?? []).map((u) => u.login);
+    const isMine = sameLogin(pull.user?.login, myLogin);
+    const isRequested = requestedReviewers.some((r) => sameLogin(r, myLogin));
+    if (isMine || isRequested) {
+      return this.enrich(repo, pull);
+    }
+    // Slim path: one reviews fetch to detect reviewedByMe; skip check-runs and mergeable_state
+    const reviews = await this.fetchReviews(repo, pull.number);
+    if (!computeReviewedByMe(reviews, myLogin)) {
+      return undefined; // Not authored by me, not a requested reviewer, not reviewed — not on board
+    }
+    return {
+      repo,
+      number: pull.number,
+      title: pull.title,
+      url: pull.html_url,
+      authorLogin: pull.user?.login ?? '',
+      isDraft: pull.draft ?? false,
+      createdAt: pull.created_at,
+      updatedAt: pull.updated_at,
+      requestedReviewers,
+      checkStatus: 'none',
+      reviewDecision: computeReviewDecision(reviews, requestedReviewers),
+      reviewedByMe: true,
+      hasConflicts: false,
+    };
   }
 
   private async enrich(repo: ForgeRepoRef, pull: GitHubPull): Promise<PullRequestSummary> {
@@ -361,17 +447,40 @@ export class GitHubClient implements ForgeClient {
   }
 
   private async fetchReviews(repo: ForgeRepoRef, prNumber: number): Promise<GitHubReview[]> {
-    const res = await this.requestOrNull(`/repos/${repo.identity}/pulls/${prNumber}/reviews?per_page=100`);
-    return res ? ((await res.json()) as GitHubReview[]) : [];
+    try {
+      return await fetchAllPages<GitHubReview>(
+        `/repos/${repo.identity}/pulls/${prNumber}/reviews?per_page=100`,
+        async (url) => {
+          const res = await this.request(url);
+          const items = (await res.json()) as GitHubReview[];
+          return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+        },
+      );
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return [];
+      }
+      throw err;
+    }
   }
 
   private async fetchCheckRuns(repo: ForgeRepoRef, sha: string): Promise<GitHubCheckRun[]> {
-    const res = await this.requestOrNull(`/repos/${repo.identity}/commits/${sha}/check-runs?per_page=100`);
-    if (!res) {
-      return [];
+    try {
+      return await fetchAllPages<GitHubCheckRun>(
+        `/repos/${repo.identity}/commits/${sha}/check-runs?per_page=100`,
+        async (url) => {
+          const res = await this.request(url);
+          const data = (await res.json()) as { check_runs: GitHubCheckRun[] };
+          const items = data.check_runs ?? [];
+          return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+        },
+      );
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return [];
+      }
+      throw err;
     }
-    const data = (await res.json()) as { check_runs: GitHubCheckRun[] };
-    return data.check_runs ?? [];
   }
 
   /**
@@ -388,40 +497,35 @@ export class GitHubClient implements ForgeClient {
     return data.mergeable_state ?? null;
   }
 
-  /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. Only the per-PR enrichment calls (`fetchReviews`, `fetchCheckRuns`, `fetchMergeableState`) wrap this in `requestOrNull` — one PR's extra data failing to load shouldn't take down the whole list the way a credential problem on the list call itself should be visible. */
+  /**
+   * Throws `ForgeHttpError` on network failures, timeouts, or non-2xx responses.
+   * `graphql()` passes a full absolute URL; everything else passes a relative path against `apiBaseUrl`.
+   */
   private async request(path: string, init?: RequestInit): Promise<Response> {
-    // `graphql()` passes a full absolute URL (GraphQL lives at a different host path than REST,
-    // see `graphqlUrl()`) — everything else here passes a relative path against `apiBaseUrl`.
     const url = /^https?:\/\//.test(path) ? path : `${this.apiBaseUrl}${path}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        ...init,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-          // Last, so a caller-supplied Accept (e.g. the raw-diff media type) wins over the default.
-          ...init?.headers,
-        },
-      });
-    } catch (err) {
-      throw new Error(`couldn't reach ${new URL(url).host}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (!res.ok) {
-      const detail = describeErrorBody(await res.text());
-      throw new Error(`${res.status} ${res.statusText} from ${new URL(url).host}${detail ? `: ${detail}` : ''}`);
-    }
-    return res;
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      // Last, so a caller-supplied Accept (e.g. the raw-diff media type) wins over the default.
+      ...((init?.headers as Record<string, string>) ?? {}),
+    };
+    return forgeFetch(url, { ...init, headers }, { fetchImpl: this.fetchImpl });
   }
 
-  /** Network failure, DNS failure, non-2xx, etc. — degrade to "nothing here" rather than throwing partway through a board render. */
+  /**
+   * Only swallows 404s (endpoint absent for this PR) — a rate-limited or timed-out enrichment
+   * call propagates so the board shows an error row instead of silently rendering wrong data.
+   */
   private async requestOrNull(path: string): Promise<Response | null> {
     try {
       return await this.request(path);
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
     }
   }
 

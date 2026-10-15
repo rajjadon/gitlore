@@ -2,42 +2,35 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AzureDevOpsClient } from '../../../../src/core/forge/AzureDevOpsClient';
 import { buildAzureDevOpsIdentity } from '../../../../src/core/forge/azureDevOpsIdentity';
+import { isCredentialRejection } from '../../../../src/core/forge/forgeFetch';
 import type { ForgeRepoRef } from '../../../../src/core/forge/types';
 
 const IDENTITY = buildAzureDevOpsIdentity({ organization: 'acme', project: 'Widgets', repository: 'widgets-api' });
 const REPO: ForgeRepoRef = { host: 'azureDevOps', identity: IDENTITY, label: 'acme/Widgets/widgets-api' };
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return {
-    ok,
+  return new Response(JSON.stringify(body), {
     status: ok ? 200 : 401,
     statusText: ok ? 'OK' : 'Unauthorized',
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  } as unknown as Response;
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 /**
  * Azure DevOps' Items API returns a file's raw content directly as the response body (not a JSON
  * envelope) when `$format=json` isn't requested — this mirrors that real behavior, including
  * `.json()` throwing a genuine `SyntaxError` on non-JSON text, the same way the real Fetch API's
- * `Response.json()` does. `jsonResponse`'s `.json()` never actually parses anything, so a test built
- * on it can't catch a caller that wrongly calls `.json()` here instead of `.text()`.
+ * `Response.json()` does. Using real `Response` means `.json()` actually parses, so a caller that
+ * wrongly calls `.json()` on non-JSON text will throw the same SyntaxError as the real API does.
  */
 function textResponse(body: string): Response {
-  return {
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    json: async () => JSON.parse(body),
-    text: async () => body,
-  } as unknown as Response;
+  return new Response(body, { status: 200 });
 }
 
 function fakeFetch(routes: Record<string, unknown>): typeof fetch {
   return (async (url: string) => {
     for (const [suffix, body] of Object.entries(routes)) {
-      if (url.endsWith(suffix)) {
+      if (url.includes(suffix)) {
         return jsonResponse(body);
       }
     }
@@ -871,4 +864,116 @@ test('createPullRequest: a rejected request throws with the real HTTP status', a
     () => client.createPullRequest(REPO, { title: 'x', base: 'main', compare: 'feature', draft: false }),
     /401 Unauthorized from dev\.azure\.com/,
   );
+});
+
+// ── A2-specific tests ─────────────────────────────────────────────────────
+
+test('A2: 401 from list endpoint throws ForgeHttpError with isCredentialRejection=true', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'bad', 'pat', (async () => new Response('{}', { status: 401 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), true);
+      return true;
+    },
+  );
+});
+
+test('A2: 503 from list endpoint throws but isCredentialRejection=false', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'tok', 'pat', (async () => new Response('{}', { status: 503 })) as typeof fetch);
+  await assert.rejects(
+    () => client.listOpenPullRequests(REPO),
+    (err: unknown) => {
+      assert.equal(isCredentialRejection(err), false);
+      return true;
+    },
+  );
+});
+
+test('A2: Azure DevOps: Authorization header present and Content-Type on requests with a body', async () => {
+  let capturedHeaders: Record<string, string> = {};
+  let capturedContentType = '';
+  const client = new AzureDevOpsClient(IDENTITY, 'my-pat', 'pat', (async (_url: string, init?: RequestInit) => {
+    capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+    capturedContentType = capturedHeaders['Content-Type'] ?? '';
+    return jsonResponse({});
+  }) as typeof fetch);
+  await client.closePullRequest(REPO, 1);
+  assert.ok(capturedHeaders['Authorization']?.startsWith('Basic '));
+  assert.equal(capturedContentType, 'application/json');
+});
+
+// ── A4: Pagination and bounded fan-out ─────────────────────────────────────
+
+function makeAdoPr(id: number) {
+  return {
+    pullRequestId: id,
+    title: `PR ${id}`,
+    createdBy: { uniqueName: `user${id}@acme.com` },
+    creationDate: '2024-01-01T00:00:00Z',
+  };
+}
+
+test('A4: listOpenPullRequests uses $top/$skip — 101 PRs across 2 pages all returned', async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => makeAdoPr(i + 1));
+  const page2 = [makeAdoPr(101)];
+  const BASE_URL = 'https://dev.azure.com/acme/Widgets/_apis/git/repositories/widgets-api';
+
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('searchCriteria.status=active') && url.includes('$skip=0')) {
+      return jsonResponse({ value: page1 });
+    }
+    if (url.includes('searchCriteria.status=active') && url.includes('$skip=100')) {
+      return jsonResponse({ value: page2 });
+    }
+    // Enrich calls — no reviewers, no statuses
+    return jsonResponse({ value: [] });
+  }) as typeof fetch);
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 101, 'must return all 101 PRs across both pages');
+});
+
+test('A4: listOpenPullRequests stops when a short page is returned', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('searchCriteria.status=active')) {
+      callCount++;
+      // Page 1 full (100 items), page 2 short (5 items)
+      if (url.includes('$skip=0')) return jsonResponse({ value: Array.from({ length: 100 }, (_, i) => makeAdoPr(i + 1)) });
+      if (url.includes('$skip=100')) return jsonResponse({ value: Array.from({ length: 5 }, (_, i) => makeAdoPr(101 + i)) });
+    }
+    return jsonResponse({ value: [] });
+  }) as typeof fetch);
+  const result = await client.listOpenPullRequests(REPO);
+  assert.equal(result.length, 105);
+  assert.equal(callCount, 2, 'should stop after the short page (2 requests total)');
+});
+
+test('A4: enrich fan-out is bounded — concurrent enrichment calls stay within limit', async () => {
+  let concurrentEnrichs = 0;
+  let maxConcurrentEnrichs = 0;
+
+  // Provide PRs with lastMergeSourceCommit so enrich calls fetchStatuses (the only enrichment request)
+  const prsWithCommit = Array.from({ length: 20 }, (_, i) => ({
+    ...makeAdoPr(i + 1),
+    lastMergeSourceCommit: { commitId: `sha${i + 1}` },
+  }));
+
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('searchCriteria.status=active')) {
+      return jsonResponse({ value: prsWithCommit });
+    }
+    // Track concurrent statuses calls as proxy for enrich concurrency
+    if (url.includes('/statuses')) {
+      concurrentEnrichs++;
+      maxConcurrentEnrichs = Math.max(maxConcurrentEnrichs, concurrentEnrichs);
+      await new Promise((r) => setTimeout(r, 10));
+      concurrentEnrichs--;
+      return jsonResponse({ value: [] });
+    }
+    return jsonResponse({ value: [] });
+  }) as typeof fetch);
+  await client.listOpenPullRequests(REPO);
+  assert.ok(maxConcurrentEnrichs <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentEnrichs}`);
+  assert.ok(maxConcurrentEnrichs > 1, 'must use some concurrency (not fully serial)');
 });

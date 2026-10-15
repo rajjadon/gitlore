@@ -11,7 +11,7 @@ import type {
   ReviewDecision,
   ReviewSubmission,
 } from './types';
-import { describeErrorBody } from './httpError';
+import { forgeFetch, ForgeHttpError, fetchAllPages, mapWithConcurrency, sameLogin } from './forgeFetch';
 
 interface BitbucketUser {
   username?: string;
@@ -40,6 +40,8 @@ interface BitbucketPullRequest {
 
 interface BitbucketPage<T> {
   values: T[];
+  /** Full URL of the next page, present when there are more results. */
+  next?: string;
 }
 
 interface BitbucketBuildStatus {
@@ -107,7 +109,7 @@ function computeReviewedByMe(pr: BitbucketPullRequest, myLogin: string | undefin
     return false;
   }
   return (pr.participants ?? []).some(
-    (p) => p.role === 'REVIEWER' && loginOf(p.user) === myLogin && (p.approved || p.state === 'changes_requested'),
+    (p) => p.role === 'REVIEWER' && sameLogin(loginOf(p.user), myLogin) && (p.approved || p.state === 'changes_requested'),
   );
 }
 
@@ -142,9 +144,15 @@ export class BitbucketClient implements ForgeClient {
   }
 
   async listOpenPullRequests(repo: ForgeRepoRef): Promise<PullRequestSummary[]> {
-    const listRes = await this.request(`/repositories/${repo.identity}/pullrequests?state=OPEN`);
-    const page = (await listRes.json()) as BitbucketPage<BitbucketPullRequest>;
-    return Promise.all(page.values.map((pr) => this.enrich(repo, pr)));
+    const raw = await fetchAllPages<BitbucketPullRequest>(
+      `/repositories/${repo.identity}/pullrequests?state=OPEN&pagelen=50`,
+      async (url) => {
+        const res = await this.request(url);
+        const page = (await res.json()) as BitbucketPage<BitbucketPullRequest>;
+        return { items: page.values, next: page.next };
+      },
+    );
+    return mapWithConcurrency(raw, 6, (pr) => this.enrich(repo, pr));
   }
 
   /** Same shape as a `listOpenPullRequests` item — reuses `enrich` directly, no separate normalization path. */
@@ -332,32 +340,24 @@ export class BitbucketClient implements ForgeClient {
 
   /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. Only `fetchBuildStatuses` wraps this in `requestOrNull` — one PR's build-status data failing to load shouldn't take down the whole list the way a credential problem on the list call itself should be visible. */
   private async request(path: string, init?: RequestInit): Promise<Response> {
-    const url = `${this.apiBaseUrl}${path}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        ...init,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        },
-      });
-    } catch (err) {
-      throw new Error(`couldn't reach ${new URL(url).host}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (!res.ok) {
-      const detail = describeErrorBody(await res.text());
-      throw new Error(`${res.status} ${res.statusText} from ${new URL(url).host}${detail ? `: ${detail}` : ''}`);
-    }
-    return res;
+    const url = /^https?:\/\//.test(path) ? path : `${this.apiBaseUrl}${path}`;
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...((init?.headers as Record<string, string>) ?? {}),
+    };
+    return forgeFetch(url, { ...init, headers }, { fetchImpl: this.fetchImpl });
   }
 
-  /** Network failure, DNS failure, non-2xx, etc. — degrade to "nothing here" rather than throwing partway through a board render. */
+  /** Only swallows 404s — other errors (auth failures, network, rate limits) propagate so the board can surface them correctly. */
   private async requestOrNull(path: string): Promise<Response | null> {
     try {
       return await this.request(path);
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
     }
   }
 }

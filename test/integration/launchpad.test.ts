@@ -26,7 +26,10 @@ function columnHtml(html: string, bucket: string): string {
 }
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return { ok, json: async () => body } as unknown as Response;
+  return new Response(JSON.stringify(body), {
+    status: ok ? 200 : 401,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 suite('Launchpad', () => {
@@ -200,13 +203,8 @@ suite('Launchpad', () => {
           return 'fake-pat';
         }) as typeof vscode.window.showInputBox;
 
-        api.launchpadProvider.setFetchImplForTest((async () => ({
-          ok: false,
-          status: 401,
-          statusText: 'Unauthorized',
-          json: async () => ({}),
-          text: async () => '{}',
-        })) as unknown as typeof fetch);
+        api.launchpadProvider.setFetchImplForTest((async () =>
+          new Response('{}', { status: 401, statusText: 'Unauthorized' })) as unknown as typeof fetch);
 
         try {
           await vscode.commands.executeCommand(COMMANDS.openLaunchpad);
@@ -1194,6 +1192,9 @@ suite('Launchpad', () => {
           if (url.includes('merge_requests/12/discussions')) {
             return jsonResponse([]);
           }
+          if (url.endsWith('/approvals')) {
+            return jsonResponse({ approved: false, approved_by: [] });
+          }
           if (url.endsWith('/merge_requests/12') && init?.method === 'PUT') {
             reopenCalled = true;
             assert.equal(init.body, JSON.stringify({ state_event: 'reopen' }));
@@ -1334,7 +1335,7 @@ suite('Launchpad', () => {
             return jsonResponse({ values: [] });
           }
           if (url.endsWith('/pullrequests/14/diff')) {
-            return { ok: true, text: async () => '' } as unknown as Response;
+            return new Response('', { status: 200 });
           }
           if (url.endsWith('/pullrequests/14/diffstat')) {
             return jsonResponse({ values: [] });

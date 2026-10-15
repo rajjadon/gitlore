@@ -187,3 +187,28 @@ test('categorizeClosedPullRequests: excludes PRs authored by someone else, even 
   );
   assert.deepEqual(result, []);
 });
+
+// N5: case-insensitive login comparisons via sameLogin
+test('categorizePullRequests: authorLogin match is case-insensitive (N5)', () => {
+  const result = categorizePullRequests(
+    [pr({ authorLogin: 'RAJ' })],
+    'raj',
+    neverSnoozed,
+  );
+  assert.equal(result.length, 1);
+  assert.equal(result[0]?.bucket, 'readyToMerge');
+});
+
+test('categorizePullRequests: requestedReviewers match is case-insensitive (N5)', () => {
+  const result = categorizePullRequests(
+    [pr({ authorLogin: 'someone-else', requestedReviewers: ['RAJ'], reviewDecision: 'reviewRequired' })],
+    'raj',
+    neverSnoozed,
+  );
+  assert.equal(result[0]?.bucket, 'needsReview');
+});
+
+test('categorizeClosedPullRequests: authorLogin match is case-insensitive (N5)', () => {
+  const result = categorizeClosedPullRequests([pr({ authorLogin: 'RAJ', merged: true, closedAt: '2024-01-05T00:00:00Z' })], 'raj');
+  assert.equal(result[0]?.bucket, 'merged');
+});

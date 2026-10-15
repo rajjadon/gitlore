@@ -2,7 +2,7 @@ import { createTwoFilesPatch } from 'diff';
 import type { FileChange } from '../git/types';
 import type { ForgeClient } from './ForgeClient';
 import { splitAzureDevOpsIdentity } from './azureDevOpsIdentity';
-import { describeErrorBody } from './httpError';
+import { forgeFetch, ForgeHttpError, mapWithConcurrency, MAX_PAGES, sameLogin } from './forgeFetch';
 import type {
   CheckStatus,
   ConversationThread,
@@ -143,7 +143,7 @@ function computeReviewedByMe(reviewers: AzureDevOpsReviewer[], myLogin: string |
   if (!myLogin) {
     return false;
   }
-  return reviewers.some((r) => loginOf(r) === myLogin && r.vote !== 0 && r.vote !== -5);
+  return reviewers.some((r) => sameLogin(loginOf(r), myLogin) && r.vote !== 0 && r.vote !== -5);
 }
 
 /**
@@ -208,9 +208,8 @@ export class AzureDevOpsClient implements ForgeClient {
     // Throws rather than soft-degrading to [] — a credential that's valid for the vssps profile
     // check but lacks "Code" scope for this endpoint (a real, easy-to-hit PAT-setup mistake) would
     // otherwise render as an indistinguishable-from-genuinely-empty board with zero signal.
-    const listRes = await this.request(`${base}/pullrequests?searchCriteria.status=active&api-version=7.1`);
-    const data = (await listRes.json()) as AzureDevOpsListResponse<AzureDevOpsPullRequest>;
-    return Promise.all(data.value.map((pr) => this.enrich(repo, id, base, pr)));
+    const raw = await this.fetchAllSkip<AzureDevOpsPullRequest>(`${base}/pullrequests?searchCriteria.status=active&api-version=7.1`);
+    return mapWithConcurrency(raw, 6, (pr) => this.enrich(repo, id, base, pr));
   }
 
   /** Same shape as a `listOpenPullRequests` item — reuses `enrich` directly, no separate normalization path. */
@@ -565,6 +564,20 @@ export class AzureDevOpsClient implements ForgeClient {
     return data.value ?? [];
   }
 
+  /** Azure DevOps paginates with `$top` + `$skip` (no Link header, no body `next`). Stops at `MAX_PAGES` pages to match the ceiling in `forgeFetch`. A short page (< top) signals the last page. */
+  private async fetchAllSkip<T>(baseUrl: string): Promise<T[]> {
+    const top = 100;
+    const all: T[] = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const sep = baseUrl.includes('?') ? '&' : '?';
+      const res = await this.request(`${baseUrl}${sep}$top=${top}&$skip=${page * top}`);
+      const data = (await res.json()) as AzureDevOpsListResponse<T>;
+      all.push(...(data.value ?? []));
+      if ((data.value?.length ?? 0) < top) break;
+    }
+    return all;
+  }
+
   /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. Only `fetchStatuses` wraps this in `requestOrNull` — a single PR's check-status enrichment failing shouldn't take down the whole list the way a credential problem on the list call itself should be visible. */
   private async request(url: string, init?: RequestInit): Promise<Response> {
     // A PAT authenticates via HTTP Basic with an empty username — Bearer support for raw PATs
@@ -573,31 +586,23 @@ export class AzureDevOpsClient implements ForgeClient {
     // ever goes as a Bearer token — Basic doesn't apply to it at all.
     const authHeader =
       this.credentialScheme === 'oauth' ? `Bearer ${this.token}` : `Basic ${Buffer.from(`:${this.token}`).toString('base64')}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(url, {
-        ...init,
-        headers: {
-          Authorization: authHeader,
-          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        },
-      });
-    } catch (err) {
-      throw new Error(`couldn't reach ${new URL(url).host}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    if (!res.ok) {
-      const detail = describeErrorBody(await res.text());
-      throw new Error(`${res.status} ${res.statusText} from ${new URL(url).host}${detail ? `: ${detail}` : ''}`);
-    }
-    return res;
+    const headers: Record<string, string> = {
+      Authorization: authHeader,
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...((init?.headers as Record<string, string>) ?? {}),
+    };
+    return forgeFetch(url, { ...init, headers }, { fetchImpl: this.fetchImpl });
   }
 
-  /** Network failure, DNS failure, non-2xx, etc. — degrade to "nothing here" rather than throwing partway through a board render. */
+  /** Only swallows 404s — other errors (auth failures, network, rate limits) propagate so the board can surface them correctly. */
   private async requestOrNull(url: string): Promise<Response | null> {
     try {
       return await this.request(url);
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
     }
   }
 }

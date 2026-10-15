@@ -6,6 +6,10 @@ The VS Code Marketplace shows this file on GitLore's extension page, so entries 
 
 ## [Unreleased]
 
+### Changed
+
+- **Launchpad: GitHub board refresh makes 3× fewer API requests for PRs you're not involved in** — previously every open PR fetched reviews, check-run status, and mergeable state (3 calls each). PRs where you're neither the author nor a requested reviewer now fetch only reviews (1 call); if you've never reviewed the PR it's omitted from the board entirely, since it can't appear in any category. PRs you authored or were asked to review still get the full 3-call enrichment.
+
 ## [1.2.5] - 2026-09-16
 
 ### Fixed
