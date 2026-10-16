@@ -16,8 +16,10 @@ eslint.config.js
 tsconfig.json
 **/*.map
 
-# Repo-internal, not for users. CLAUDE.md is the project's own working instructions.
+# Repo-internal, not for users. CLAUDE.md and AGENTS.md are the project's own working instructions
+# for AI coding assistants (AGENTS.md is the same document for assistants that read that name).
 CLAUDE.md
+AGENTS.md
 .github/**
 .vscode/**
 .claude/**
