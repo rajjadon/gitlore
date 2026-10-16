@@ -43,7 +43,7 @@ Raj — full-stack developer, based in India. Works primarily in TypeScript and 
 3. **Minimal surface area.** A UI element must earn its place. No sidebars full of empty sections. If a feature can be a hover instead of a panel, make it a hover.
 4. **AI-native, not AI-bolted-on.** AI is a first-class citizen via the VS Code Language Model API (`vscode.lm`), so users bring their own model (Copilot, Ollama, Claude, etc.). No GitLore backend, no proxied keys.
 5. **Respect the editor.** Use native VS Code APIs — CodeLens, Decorations, TreeView, Webview, Hover — not reinvented primitives.
-6. **Local-first & private.** Zero telemetry by default. Git data never leaves the machine unless the user explicitly enables an AI feature that sends a diff to *their own* model.
+6. **Local-first & private.** Zero telemetry by default. Git data never leaves the machine unless the user explicitly opts in: AI features (`gitLore.ai.enabled`) send diffs to *their own* model; Launchpad and the status-bar item (`gitLore.launchpad.enabled`) query the user's own git host. Both are opt-in and off by default.
 
 When a request violates one of these, say so and propose an alternative that doesn't.
 
@@ -109,6 +109,7 @@ Never let a `vscode` import leak into `core/`. If you're tempted, the logic belo
 | `diff` | Client-side unified diffs | Only for Azure DevOps PR diffs (`AzureDevOpsClient.getPullRequestDiff`) — the one host with no diff-text endpoint of its own |
 | `esbuild` | Bundler | dev dep |
 | `@vscode/test-electron` | Integration tests | dev dep |
+| `playwright` | Webview render unit tests (`test/unit/skeleton.render.test.ts`) | dev dep — run `npx playwright install chromium` once after `npm install` |
 | `@types/vscode`, `@types/node` | Types | dev dep |
 | `eslint`, `@typescript-eslint/*` | Linting | dev dep |
 
@@ -126,6 +127,7 @@ Never let a `vscode` import leak into `core/`. If you're tempted, the logic belo
 - [x] **File history** — TreeView of every commit touching the current file, newest first
 - [x] **Commit details** — Webview: message, author, full diff, files changed, copy-SHA button
 - [x] **Status bar** — current line's last author + age (e.g. `Raj, 3 days ago`), click → commit details
+- [x] **Blame `.git-blame-ignore-revs` support** — auto-detected, no config needed; honours git's own convention for mass-reformat commits
 
 ### Phase 2 — Intelligence (the "Sense" in GitLore) — shipped 0.3.0
 - [x] **AI commit summary** — `vscode.lm` turns a commit + diff into a plain-English summary
@@ -133,6 +135,9 @@ Never let a `vscode` import leak into `core/`. If you're tempted, the logic belo
 - [x] **Stale-code detector** — flag files/functions untouched for > `staleThresholdDays`, shown as a subtle CodeLens
 - [x] **Author ownership** — per-file heatmap: who owns which regions, by line count and recency
 - [x] **AI commit message generation** — drafts a message from the staged diff straight into the Source Control input box, via a title-bar button there; same opt-in gate and infrastructure as commit summary/line explanation
+- [x] **Co-change CodeLens** — above each file, lists other files that frequently changed alongside it ("logical coupling" from git history); `gitLore.coChange.enabled` (on by default). Command: `gitLore.showCoChangedFiles`
+- [x] **GitLore Chat** — a docked chat panel for free-form questions about repo history; the model answers by calling local git-backed tools (file history, line history, commit diff, commits between refs, branches). Also reachable pre-seeded via **Ask GitLore About This File/Commit/Line/Pull Request** (`gitLore.askAboutFile`, `askAboutCommit`, `askAboutLine`, `askAboutPullRequest`). Same `gitLore.ai.enabled` gate; no network calls — every tool call is a local git read
+- [x] **Generate Changelog with AI** — picks two refs, streams a Markdown changelog (Added/Changed/Fixed) into a fresh editor tab (`gitLore.generateChangelog`). Same gate and infrastructure as other AI features
 
 ### Phase 3 — Graph & collaboration — shipped 0.1.0–0.2.0 (built ahead of Phase 2)
 - [x] **Commit graph** — interactive DAG in a Webview
@@ -147,6 +152,8 @@ Extends existing hover/decoration/webview code already in the repo — no new vi
 
 ### Phase 5 — Repository views
 - [x] **Sidebar explorer tree** — one view container: Branches, Remotes, Tags, Stashes, Worktrees, Contributors, with ahead/behind status and right-click actions
+- [x] **Explorer write actions** — rename branch (`gitLore.renameBranchFromExplorer`), delete branch (`gitLore.deleteBranchFromExplorer`), delete tag (`gitLore.deleteTagFromExplorer`), add/remove worktree (`gitLore.addWorktreeFromExplorer` / `gitLore.removeWorktreeFromExplorer`), create stash (`gitLore.createStashFromExplorer`), merge branch into current (`gitLore.mergeBranchFromExplorer`), rebase current onto branch (`gitLore.rebaseOntoBranchFromExplorer`). Merge and rebase run in a real terminal; destructive actions confirm first
+- [x] **Reflog recovery** — `gitLore.recoverFromReflog` lists recent reflog entries and creates a branch at whichever one you pick — for recovering from a hard reset, force push, or accidental delete before git GCs it
 
 ### Phase 6 — Visual history & rebase
 - [x] **Visual File History** — author-swimlane bubble timeline (additions/deletions over time), as an alternative to the existing tree-based File History
@@ -164,6 +171,24 @@ The only feature that reaches beyond the local repo — needs PR/CI status, not 
 - [x] **PR review actions: add a comment** — a comment box in the Pull Request Details panel posts a top-level PR comment via `ForgeClient.addComment`, all four hosts REST
 - [x] **PR review actions: resolve conversation threads** — the Pull Request Details panel lists review conversations with a Resolve button per unresolved one. GitHub has no REST endpoint for this at all — `GitHubClient` gained a second request path (`graphql()`, alongside its normal REST `request()`) purely for the `reviewThreads` query and `resolveReviewThread` mutation; the other three hosts are plain REST
 
+### Phase 8 — Review depth & glanceable status
+Extends PR Details and Launchpad. The privacy contract is unchanged: Launchpad, Create PR, the status-bar item, and "Open PR for this commit" are the only features that call out to a remote host, and all share the single `gitLore.launchpad.enabled` toggle.
+- [x] **Full PR thread depth** — thread cards show all comments (author, body, relative time), a Reply textarea, an Unresolve button on resolved threads, a Resolve button on unresolved ones. After a reply or resolve/unresolve the panel refreshes threads automatically
+- [x] **Review comment with verdict** — Approve / Request changes read an optional review-comment textarea and pass it as `body` to `ForgeClient.submitReview`; empty/whitespace → no comment step; GitLab requestChanges throws its platform-gap error unchanged
+- [x] **Checks list** — a Checks section in PR Details lazily loads `ForgeClient.listChecks`; failing first, then pending, then passing collapsed; each check with a URL is an external link (validated https only); skeleton while loading; failed load shows an inline error, never blocks the diff
+- [x] **Jump-to-file** — a thread's `file:line` renders as a button that scrolls to that file's section in the panel's diff; disabled with a reason if the file isn't in the diff
+- [x] **Unresolved thread badge** — header shows an unresolved-thread count (text + icon, not color alone); hidden at 0
+- [x] **Head-SHA-keyed diff/AI caches** — one diff cache in PR Details keyed `${prKey}@${headSha}`; shared by load, explainPr, and draftReview so a single head SHA is fetched at most once; AI caches include headSha so a new push invalidates them
+- [x] **Launchpad polish** — board refreshes when the window regains focus (throttled ≥ 60 s, never while a refresh is in flight); timed snooze (1 hour / Tomorrow 9am / Until the PR changes) via QuickPick; snooze state auto-expires and auto-unsnoozes on `updatedAt` change; board shows "Updated N min ago" and keeps showing last-good data (marked stale) when a repo refresh fails; bucket rule: a PR you did not author never goes to Blocked — reviewer-requested review wins → Needs Review; Blocked only for your own PRs
+- [x] **Launchpad status-bar item** — `$(git-pull-request) N` item (`src/providers/LaunchpadStatusBar.ts`) showing PRs that need your review; on by default when `gitLore.launchpad.enabled` is true (`gitLore.launchpad.statusBar.enabled`, default `true`); never prompts; hidden/silent when Launchpad is disabled; refreshes share the same throttled load as the board (no duplicate network calls)
+
+### Phase 9 — Local-history depth
+- [x] **Per-file AI review for large PRs** — `draftReview` splits the diff by file when the whole diff exceeds `maxDiffChars`; maps up to 12 file-level review calls, then one synthesis call that streams the result; progress messages to the webview; abortable; re-drafting after a thread resolve reuses the per-file cache
+- [x] **Blame move/copy detection** — `gitLore.blame.detectMoves` (boolean, default `false`); when true, `blameFile` adds `-M -C`; cache key includes the flag so toggling doesn't serve stale blame
+- [x] **Find When Text Was Added or Removed** — command `gitLore.findWhenTextChanged` ("GitLore: Find When Text Was Added or Removed"); prefilled from selection, QuickPick of results (using `git log -S`/`-G`), opens Commit Details on pick
+- [x] **Line-range history** — `getLineHistory` accepts a start/end range (`-L start,end:file`); single-line callers keep working; Explain/Step history commands use the active selection when non-empty
+- [x] **Open PR for this commit** — `gitLore.openPullRequestForCommit`; a hover-card action "Open PR" that resolves on click (never on hover); hidden unless `gitLore.launchpad.enabled`; uses the silent token path (no prompt — unsigned → one inline info message); opens PR Details if it's on the board, else browser (validated URL); result cached per (repo, sha) via `LruCache`
+
 Do not start a phase until the previous phase is tested and merged.
 
 **Naming:** whatever inspires a phase, GitLore ships under its own name only — no competitor product or company names in code, comments, settings, commands, or docs.
@@ -173,59 +198,114 @@ Do not start a phase until the previous phase is tested and merged.
 ## 8. Public contributions (define in `package.json`)
 
 ### Commands
+All 43 commands come from `package.json` `contributes.commands` — IDs must be in `constants.ts`, titles must match exactly.
+
 | Command ID (use `constants.ts`) | Title |
 |---|---|
 | `gitLore.toggleBlame` | GitLore: Toggle Inline Blame |
 | `gitLore.showFileHistory` | GitLore: Show File History |
 | `gitLore.loadMoreFileHistory` | GitLore: Load More File History |
-| `gitLore.showCommit` | GitLore: Show Commit Details |
-| `gitLore.explainCommit` | GitLore: Explain Commit with AI |
-| `gitLore.explainLine` | GitLore: Explain This Line's History |
-| `gitLore.generateCommitMessage` | GitLore: Generate Commit Message with AI |
 | `gitLore.copySha` | GitLore: Copy Commit SHA |
+| `gitLore.showCommit` | GitLore: Show Commit Details |
+| `gitLore.showPullRequest` | GitLore: Show Pull Request Details |
+| `gitLore.openPullRequestForCommit` | GitLore: Open Pull Request for Commit |
+| `gitLore.findWhenTextChanged` | GitLore: Find When Text Was Added or Removed |
 | `gitLore.openGraph` | GitLore: Open Commit Graph |
 | `gitLore.showVisualFileHistory` | GitLore: Show Visual File History |
 | `gitLore.compareBranches` | GitLore: Compare Branches |
+| `gitLore.explainCommit` | GitLore: Explain Commit with AI |
+| `gitLore.explainPullRequest` | GitLore: Explain Pull Request with AI |
+| `gitLore.summarizeBranchComparison` | GitLore: Summarize Branch Comparison with AI |
+| `gitLore.draftPrReview` | GitLore: Draft PR Review Comment with AI |
+| `gitLore.generateCommitMessage` | GitLore: Generate Commit Message with AI |
+| `gitLore.explainLine` | GitLore: Explain This Line's History |
 | `gitLore.showFileOwnership` | GitLore: Show File Ownership |
 | `gitLore.rebaseInteractively` | GitLore: Rebase Branch Interactively... |
 | `gitLore.checkoutBranch` | GitLore: Checkout Branch |
 | `gitLore.compareBranchFromExplorer` | GitLore: Compare with Current Branch |
+| `gitLore.mergeBranchFromExplorer` | GitLore: Merge into Current Branch |
+| `gitLore.rebaseOntoBranchFromExplorer` | GitLore: Rebase Current Branch onto This |
 | `gitLore.openRemote` | GitLore: Open Remote in Browser |
 | `gitLore.applyStash` | GitLore: Apply Stash |
 | `gitLore.dropStash` | GitLore: Drop Stash |
+| `gitLore.renameBranchFromExplorer` | GitLore: Rename Branch |
+| `gitLore.deleteBranchFromExplorer` | GitLore: Delete Branch |
+| `gitLore.deleteTagFromExplorer` | GitLore: Delete Tag |
+| `gitLore.addWorktreeFromExplorer` | GitLore: Add Worktree |
+| `gitLore.removeWorktreeFromExplorer` | GitLore: Remove Worktree |
+| `gitLore.createStashFromExplorer` | GitLore: New Stash |
+| `gitLore.recoverFromReflog` | GitLore: Recover Lost Commit or Branch |
 | `gitLore.stepLineHistory` | GitLore: Step Through This Line's History |
+| `gitLore.showCoChangedFiles` | GitLore: Show Files That Often Change With This One |
 | `gitLore.toggleFullFileBlame` | GitLore: Toggle Full-File Blame Heatmap |
 | `gitLore.openLaunchpad` | GitLore: Open Launchpad |
-| `gitLore.showPullRequest` | GitLore: Show Pull Request Details |
+| `gitLore.openChat` | GitLore: Open Chat |
+| `gitLore.askAboutFile` | GitLore: Ask GitLore About This File |
+| `gitLore.askAboutCommit` | GitLore: Ask GitLore About This Commit |
+| `gitLore.askAboutLine` | GitLore: Ask GitLore About This Line |
+| `gitLore.askAboutPullRequest` | GitLore: Ask GitLore About This Pull Request |
+| `gitLore.generateChangelog` | GitLore: Generate Changelog with AI |
 
 ### Settings (all under `gitLore.*`)
+All 24 settings come from `package.json` `contributes.configuration.properties`. Keys, types, and defaults must match exactly.
+
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `gitLore.blame.enabled` | boolean | `true` | Show inline blame decorations |
+| `gitLore.blame.enabled` | boolean | `true` | Show inline blame decorations, hover cards, and the status bar item |
 | `gitLore.blame.format` | string | `"{author}, {age}"` | Blame text template. Tokens: `{author} {age} {date} {message} {sha}` |
-| `gitLore.blame.highlightCurrentLine` | boolean | `true` | Highlight the current line's blame |
-| `gitLore.blame.ignoreWhitespace` | boolean | `true` | Pass `-w` to git blame |
-| `gitLore.ai.enabled` | boolean | `false` | Enable AI features (uses your own model via vscode.lm) |
-| `gitLore.ai.modelFamily` | string | `"gpt-4o"` | Preferred LM family hint |
-| `gitLore.ai.maxDiffChars` | number | `8000` | Max diff size sent to the model |
-| `gitLore.staleCode.enabled` | boolean | `true` | Show the stale-code CodeLens above untouched functions/methods |
-| `gitLore.staleThresholdDays` | number | `180` | Days before a function is considered stale |
+| `gitLore.blame.highlightCurrentLine` | boolean | `true` | Highlight the current line's blame decoration |
+| `gitLore.blame.ignoreWhitespace` | boolean | `true` | Pass `-w` to git blame to ignore whitespace-only changes |
+| `gitLore.blame.detectMoves` | boolean | `false` | Pass `-M -C` to git blame to follow lines moved or copied between files. More accurate for refactored code, slower on large files |
+| `gitLore.maxBlameFileSize` | number | `1048576` | Skip blame for files larger than this size, in bytes |
 | `gitLore.maxHistoryItems` | number | `200` | Max commits loaded per file history |
 | `gitLore.maxGraphItems` | number | `200` | Max commits loaded in the commit graph |
-| `gitLore.maxBlameFileSize` | number | `1048576` | Skip blame for files larger than this (bytes) |
-| `gitLore.ownership.enabled` | boolean | `false` | Show a per-line author color mark in the overview ruler |
+| `gitLore.staleCode.enabled` | boolean | `true` | Show a CodeLens above functions and methods that haven't changed in longer than staleThresholdDays |
+| `gitLore.staleThresholdDays` | number | `180` | Days since a function's or method's last change before it's flagged as stale |
+| `gitLore.coChange.enabled` | boolean | `true` | Show a CodeLens above the file for other files that frequently change alongside it (a "logical coupling" signal from git history) |
+| `gitLore.ownership.enabled` | boolean | `false` | Show a color mark per line in the editor's overview ruler for that line's author |
 | `gitLore.fullFileBlame.enabled` | boolean | `false` | Show a hot-to-cold recency gradient as a left-edge mark per line, across the whole file |
 | `gitLore.issueLinking.enabled` | boolean | `true` | Auto-link issue/PR references (e.g. `#123`) in commit messages |
-| `gitLore.issueLinking.pattern` | string | `"#(\\d+)"` | Regex matching issue/PR references; first capture group fills `{issue}` |
-| `gitLore.issueLinking.urlTemplate` | string | `""` | `{issue}`-templated URL for issue links; empty auto-detects from the GitHub/GitLab remote |
+| `gitLore.issueLinking.pattern` | string | `"#(\\d+)"` | Regex matching issue/PR references; first capture group (or whole match) fills `{issue}` |
+| `gitLore.issueLinking.urlTemplate` | string | `""` | `{issue}`-templated URL for issue links; empty = auto-detect from the GitHub/GitLab remote |
+| `gitLore.ai.enabled` | boolean | `false` | Enable AI features (commit summaries, line explanations). Uses your own model via `vscode.lm` — no key or diff leaves your machine unless this is on |
+| `gitLore.ai.modelFamily` | string | `"gpt-4o"` | Preferred language model family hint (e.g. `gpt-4o`, `claude-3.5-sonnet`). Falls back to any available model |
+| `gitLore.ai.maxDiffChars` | number | `8000` | Max diff size, in characters, sent to the model. Longer diffs are truncated |
+| `gitLore.ai.maxToolIterations` | number | `6` | Max tool-call round trips GitLore Chat makes per question before stopping |
 | `gitLore.rebaseEditor.enabled` | boolean | `true` | Use GitLore's Interactive Rebase Editor for `git-rebase-todo` files |
 | `gitLore.launchpad.enabled` | boolean | `false` | Enable Launchpad, the cross-repo PR triage board — the only setting that makes GitLore call out to a remote host |
+| `gitLore.launchpad.statusBar.enabled` | boolean | `true` | Show a status-bar item with PRs needing your review. Only active when `gitLore.launchpad.enabled` is also true; never created and makes zero network calls when Launchpad is disabled |
 | `gitLore.launchpad.customHosts` | array | `[]` | Self-hosted/custom forge instances Launchpad can't recognize by hostname alone: `{ hostname, flavor, apiBaseUrl }[]` |
 
 ### Views
-Register a TreeView **only when it has content**. Contributed view: `gitLore.fileHistory` in the SCM or Explorer container (decide via config, default Explorer).
+What `package.json` actually contributes (read from source, not from memory):
+
+**Activity bar container** (`gitLoreExplorer`):
+- `gitLore.explorer` — the sidebar explorer tree (Branches, Remotes, Tags, Stashes, Worktrees, Contributors)
+
+**Explorer sidebar** (collapsed when empty):
+- `gitLore.fileHistory` — File History tree, shown only when `gitLore.fileHistory.hasContent` is set
+
+**GitLore panel container** (`gitLore` panel tab) — six webview views, the graph visible by default, the rest collapsed:
+- `gitLore.commitGraph` — Commit Graph
+- `gitLore.commitDetails` — Commit Details
+- `gitLore.branchComparison` — Branch Comparison
+- `gitLore.visualFileHistory` — Visual File History
+- `gitLore.pullRequestDetails` — Pull Request Details
+- `gitLore.chat` — Chat
+
+**Custom editor** (opens automatically when git opens the rebase todo file):
+- `gitLore.rebaseEditor` — GitLore Interactive Rebase (handles `**/rebase-merge/git-rebase-todo` and `**/rebase-apply/git-rebase-todo`)
+
+**Standalone webview panels** (opened by command, not contributed as views):
+- Launchpad — opened by `gitLore.openLaunchpad`; not in `contributes.views` because it's a full-screen `vscode.window.createWebviewPanel`
+
+Total webview surfaces: eight (Commit Graph, Commit Details, Branch Comparison, Visual File History, Pull Request Details, Chat, Rebase Editor, Launchpad). §18's fixed design-token palette applies to all eight.
+
+Register a TreeView **only when it has content** (`when` clause or `setContext`). Never show an empty panel.
 
 ### Activation events
+`onStartupFinished` — the only activation event. Never `*`.
+
 Prefer `onStartupFinished` over `*`. Never use `*`. Better still, activate on the specific commands and `workspaceContains:.git` where possible.
 
 ---
@@ -400,13 +480,15 @@ Create a dedicated `OutputChannel` named `GitLore` for diagnostics. Never `conso
 ## 17. Build & dev commands
 
 ```bash
-npm install           # install deps
-npm run compile       # type-check + esbuild bundle → out/
-npm run watch         # esbuild watch for development
-npm run test          # unit + integration
-npm run test:unit     # fast core-only tests
-npm run lint          # eslint + tsc --noEmit
-npm run package       # vsce package → gitlore-x.x.x.vsix
+npm install                      # install deps
+npx playwright install chromium  # one-time: needed for webview render tests
+npm run compile                  # type-check + esbuild bundle → out/
+npm run watch                    # esbuild watch for development
+npm run test                     # unit + integration
+npm run test:unit                # fast core-only tests (no VS Code host)
+npm run test:coverage            # Node built-in coverage for src/core/** (no new dep)
+npm run lint                     # eslint + tsc --noEmit
+npm run package                  # vsce package → gitlore-x.x.x.vsix
 ```
 
 Press **F5** to launch the Extension Development Host with the extension loaded.

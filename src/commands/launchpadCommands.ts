@@ -9,11 +9,10 @@ export function handleOpenLaunchpadCommand(provider: LaunchpadViewProvider): vsc
     // Checked before anything else: Launchpad is the one feature that calls out to a remote host
     // at all, so it stays off until asked for, same as AI — no surprise network calls.
     if (!enabled) {
-      void vscode.window.showInformationMessage('GitLore: Launchpad is disabled.', 'Open Settings').then((choice) => {
-        if (choice) {
-          void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.launchpadEnabled}`);
-        }
-      });
+      const choice = await vscode.window.showInformationMessage('GitLore: Launchpad is disabled.', 'Open Settings');
+      if (choice) {
+        void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.launchpadEnabled}`);
+      }
       return;
     }
     await provider.show();

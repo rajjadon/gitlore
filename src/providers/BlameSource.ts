@@ -55,7 +55,10 @@ export class BlameSource implements vscode.Disposable {
       return null;
     }
 
-    const key = buildCacheKey(repoRoot, filePath, REF);
+    // Encode blame flags in the ref segment so toggling ignoreWhitespace or detectMoves
+    // produces a different key and avoids serving stale blame from before the toggle.
+    const optsKey = `${opts.ignoreWhitespace ? 'w' : ''}${opts.detectMoves ? 'm' : ''}`;
+    const key = buildCacheKey(repoRoot, filePath, `${REF}:${optsKey}`);
     const cached = this.cache.get(key);
     if (cached) {
       return cached;

@@ -75,7 +75,8 @@ export class OwnershipDecorationProvider implements vscode.Disposable {
     }
 
     const ignoreWhitespace = this.getConfig<boolean>(CONFIG.blameIgnoreWhitespace, true);
-    const blameLines = await this.source.getBlameLines(filePath, { ignoreWhitespace });
+    const detectMoves = this.getConfig<boolean>(CONFIG.blameDetectMoves, false);
+    const blameLines = await this.source.getBlameLines(filePath, { ignoreWhitespace, detectMoves });
     if (!this.enabled) {
       return;
     }

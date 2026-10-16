@@ -1,28 +1,28 @@
 import * as vscode from 'vscode';
 import type { ForgeClient } from '../../core/forge/ForgeClient';
 import type { ConversationThread, MergeStrategy, PullRequestSummary, ReviewSubmission } from '../../core/forge/types';
-import { pullRequestKey } from '../../core/forge/types';
-import { renderPullRequestDetailsHtml } from './render';
+import { renderPullRequestDetailsHtml, renderChecks } from './render';
+import { PullRequestDiffCache } from '../../core/forge/PullRequestDiffCache';
 import { renderPlaceholderHtml } from '../placeholder';
 import { waitForWebviewView } from '../waitForWebviewView';
 import { LruCache } from '../../core/cache/LruCache';
 import type { LanguageModelClient } from '../../ai/LanguageModelClient';
 import type { GitLogger } from '../../core/git/errors';
-import { runCommitSummaryFlow } from '../../core/ai/commitSummaryFlow';
 import { buildPrExplanationPrompt, buildPrReviewDraftPrompt } from '../../core/ai/prompts';
+import { runReviewFlow } from '../../core/ai/reviewFlow';
+import {
+  buildFileReviewPrompt,
+  buildReviewSynthesisPrompt,
+  buildExplanationSynthesisPrompt,
+} from '../../core/ai/fileReview';
 import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { CONFIG, MEDIA, VIEWS } from '../../constants';
 import { closePullRequestFlow, mergePullRequestFlow, reopenPullRequestFlow, submitReviewFlow } from '../pullRequestActions';
 import { vscodePullRequestActionUi } from '../pullRequestActionUi';
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
+import { diffCacheKey } from '../../core/forge/PullRequestDiffCache';
+import type { PullRequestDiff } from '../../core/forge/types';
+import { createNonce } from '../nonce';
+import { showAiDisabledNotice } from '../../ai/showAiDisabledNotice';
 
 /** Docks a PR's diff/commits in the bottom panel (next to Commit Details), instead of opening a new editor tab per PR — same shape as `CommitDetailsViewProvider`, for a PR instead of a local commit. */
 export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvider {
@@ -31,6 +31,20 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
   private currentUrl: string | undefined;
   private currentClient: ForgeClient | undefined;
   private aiSummaryCache = new LruCache<string, string>(50);
+  /**
+   * Per-file summary cache for the map step in large-diff reviews and explanations (E1.3).
+   *
+   * Key: `diffCacheKey(pr) + ':file:' + filePath`. Using the same key prefix as the diff cache
+   * means a new headSha automatically invalidates every per-file entry for that PR — no explicit
+   * eviction needed. Sized generously (200) to hold all files across a typical large PR session.
+   */
+  private fileSummaryCache = new LruCache<string, string>(200);
+  /**
+   * Shared diff cache across load/explainPr/draftReview. Handles concurrent in-flight
+   * deduplication, rejected-fetch-not-cached, force-push invalidation, and empty-headSha
+   * keying on updatedAt (B1.3 a–d). See PullRequestDiffCache for the full guarantee set.
+   */
+  private diffCache = new PullRequestDiffCache();
   private aiAbortController: AbortController | undefined;
   private aiMessagesForTest: unknown[] = [];
 
@@ -47,6 +61,15 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
 
   getAiSummaryMessagesForTest(): unknown[] {
     return this.aiMessagesForTest;
+  }
+
+  /**
+   * Test-only seam — clears the diff cache so the next explainPr/draftReview truly fetches from
+   * the network instead of being served the result already cached by load(). This lets integration
+   * tests simulate a post-load credential expiry or rate-limit by counting diff calls.
+   */
+  clearDiffCacheForTest(): void {
+    this.diffCache = new PullRequestDiffCache();
   }
 
   /** A short label for the chat's subject chip, e.g. when opened via "Ask about this PR". */
@@ -83,6 +106,15 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     return this.view?.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', name)).toString() ?? '';
   }
 
+  /**
+   * Fetches (or returns cached) diff for the given PR. Delegates to PullRequestDiffCache which
+   * satisfies B1.3 a–d: in-flight deduplication, rejected-fetch-not-cached, force-push
+   * invalidation, and empty-headSha keying on updatedAt.
+   */
+  private async fetchDiff(pr: PullRequestSummary, client: ForgeClient): Promise<PullRequestDiff> {
+    return this.diffCache.getOrFetch(pr, client);
+  }
+
   private async load(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
     if (!this.view) {
       return;
@@ -102,21 +134,24 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     });
 
     try {
-      const [{ files, diff }, threads] = await Promise.all([
-        client.getPullRequestDiff(pr.repo, pr.number),
+      const [diffResult, threads] = await Promise.all([
+        this.fetchDiff(pr, client),
         client.listConversationThreads(pr.repo, pr.number),
       ]);
       if (!this.view) {
         return;
       }
       this.view.webview.html = renderPullRequestDetailsHtml(
-        { pr, files, diff, threads },
+        { pr, files: diffResult.files, diff: diffResult.diff, threads },
         {
           nonce: createNonce(),
           cspSource: this.view.webview.cspSource,
           styleUris,
         },
       );
+      // Load checks lazily after the initial render so they don't block the diff (B4.3).
+      // Runs async — the checks skeleton in the HTML is replaced by the result.
+      void this.loadChecks(pr, client);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.view.webview.html = renderPlaceholderHtml(`GitLore: failed to load this pull request's diff — ${message}`, {
@@ -128,11 +163,31 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     }
   }
 
+  /**
+   * Fetches checks and posts the rendered HTML to the webview's checks section. A load failure
+   * posts an inline error message — it never throws out of load() or blocks the diff (B4.3).
+   */
+  private async loadChecks(pr: PullRequestSummary, client: ForgeClient): Promise<void> {
+    try {
+      const checks = await client.listChecks(pr.repo, pr.number);
+      void this.view?.webview.postMessage({ type: 'checksLoaded', html: renderChecks(checks) });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      void this.view?.webview.postMessage({ type: 'checksFailed', message });
+    }
+  }
+
   private async handleMessage(message: unknown): Promise<void> {
     if (typeof message !== 'object' || message === null) {
       return;
     }
-    const { type, body, threadId, decision } = message as { type?: unknown; body?: unknown; threadId?: unknown; decision?: unknown };
+    const msg = message as Record<string, unknown>;
+    const type = msg['type'];
+    const body = msg['body'];
+    const threadId = msg['threadId'];
+    const decision = msg['decision'];
+    const url = msg['url'];
+
     if (type === 'openRemote' && this.currentUrl) {
       await vscode.env.openExternal(vscode.Uri.parse(this.currentUrl));
       return;
@@ -143,6 +198,29 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     }
     if (type === 'resolveThread' && typeof threadId === 'string' && this.currentPr && this.currentClient) {
       await this.resolveThread(this.currentPr, this.currentClient, threadId);
+      return;
+    }
+    if (type === 'unresolveThread' && typeof threadId === 'string' && this.currentPr && this.currentClient) {
+      await this.unresolveThread(this.currentPr, this.currentClient, threadId);
+      return;
+    }
+    if (type === 'replyToThread' && typeof threadId === 'string' && typeof body === 'string' && this.currentPr && this.currentClient) {
+      await this.replyToThread(this.currentPr, this.currentClient, threadId, body);
+      return;
+    }
+    if (type === 'openCheckUrl' && typeof url === 'string') {
+      // Only http(s) URLs are opened — other schemes (javascript:, file:, …) are rejected silently.
+      // The render layer already omits data-check-url for unsafe schemes; this is defense in depth.
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+          await vscode.env.openExternal(vscode.Uri.parse(url));
+        } else {
+          this.logger.error(`PR Details: rejected check URL with unsafe scheme: ${parsed.protocol}`);
+        }
+      } catch {
+        this.logger.error(`PR Details: rejected malformed check URL: ${url}`);
+      }
       return;
     }
     if (type === 'explainPr') {
@@ -166,7 +244,8 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       return;
     }
     if (type === 'submitReview' && (decision === 'approve' || decision === 'requestChanges') && this.currentPr && this.currentClient) {
-      await this.submitReview(this.currentPr, this.currentClient, decision);
+      const reviewBody = typeof body === 'string' ? body : undefined;
+      await this.submitReview(this.currentPr, this.currentClient, decision, reviewBody);
       return;
     }
     if (type === 'refresh' && this.currentPr && this.currentClient) {
@@ -200,6 +279,42 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       return;
     }
     await this.resolveThread(this.currentPr, this.currentClient, threadId);
+  }
+
+  private async unresolveThread(pr: PullRequestSummary, client: ForgeClient, threadId: string): Promise<void> {
+    try {
+      await client.unresolveConversationThread(pr.repo, pr.number, threadId);
+      await this.load(pr, client);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`GitLore: couldn't unresolve that conversation — ${message}`);
+      void this.view?.webview.postMessage({ type: 'unresolveThreadFailed', threadId });
+    }
+  }
+
+  /** Test-only seam — unresolve a thread by ID without needing a webview click. */
+  async unresolveThreadForTest(threadId: string): Promise<void> {
+    if (!this.currentPr || !this.currentClient) { return; }
+    await this.unresolveThread(this.currentPr, this.currentClient, threadId);
+  }
+
+  private async replyToThread(pr: PullRequestSummary, client: ForgeClient, threadId: string, body: string): Promise<void> {
+    try {
+      await client.replyToThread(pr.repo, pr.number, threadId, body);
+      void this.view?.webview.postMessage({ type: 'replyPosted', threadId });
+      // Reload threads so the new reply appears without a full page reload (the diff stays cached).
+      await this.load(pr, client);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`GitLore: couldn't post that reply — ${message}`);
+      void this.view?.webview.postMessage({ type: 'replyFailed', threadId });
+    }
+  }
+
+  /** Test-only seam — reply to a thread directly. */
+  async replyToThreadForTest(threadId: string, body: string): Promise<void> {
+    if (!this.currentPr || !this.currentClient) { return; }
+    await this.replyToThread(this.currentPr, this.currentClient, threadId, body);
   }
 
   /** After a successful action, refetch and re-render. On failure, posts `actionFailed` so the webview can reset its busy state. */
@@ -288,13 +403,13 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
    * `getAuthenticatedLogin` is called live each time (not cached) — the panel only shows one PR at
    * a time, so the overhead is negligible, and it's more accurate than a stale cached value.
    */
-  private async submitReview(pr: PullRequestSummary, client: ForgeClient, decision: ReviewSubmission): Promise<void> {
+  private async submitReview(pr: PullRequestSummary, client: ForgeClient, decision: ReviewSubmission, body?: string): Promise<void> {
     const login = await client.getAuthenticatedLogin();
     const changed = await submitReviewFlow({
       pr, client, ui: vscodePullRequestActionUi,
       logError: (m, e) => { this.logger.error(`PR Details: ${m}`, e); void this.view?.webview.postMessage({ type: 'actionFailed' }); },
       myLogin: login ?? undefined,
-    }, decision);
+    }, decision, body);
     if (changed) await this.reloadAfterAction(pr, client);
   }
 
@@ -348,25 +463,33 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     const modelFamily = config.get<string>(CONFIG.aiModelFamily, 'gpt-4o');
     const maxDiffChars = config.get<number>(CONFIG.aiMaxDiffChars, 8000);
 
-    const cacheKey = pullRequestKey(pr);
+    // AI summary cache now keyed by diffCacheKey(pr) which includes headSha — a force-push
+    // produces a different key and invalidates the stale explanation (fixes P5 from the roadmap).
+    const cacheKey = diffCacheKey(pr);
     const cached = this.aiSummaryCache.get(cacheKey);
 
-    // AI-disabled is one of runCommitSummaryFlow's own branches ('disabled'), but that check
-    // happens only once the flow starts — too late to guard the diff fetch below, which is a real
-    // network call to the forge host (unlike CommitDetailsViewProvider's diff, which is free local
-    // state). Checking `enabled` here, before any I/O, keeps a disabled-AI click from ever hitting
-    // the network only to throw the result away.
+    if (!enabled) {
+      // Check before any I/O — a disabled-AI click must not trigger a diff fetch.
+      void showAiDisabledNotice();
+      this.postAiMessage({ type: 'aiSummaryReset' });
+      return;
+    }
+
+    if (cached) {
+      this.postAiMessage({ type: 'aiSummaryCached', text: cached });
+      return;
+    }
+
+    // Fetch diff before starting the model flow. Uses the shared diff cache — no extra network
+    // call if load() already fetched this diff for the current PR head SHA.
     let diff = '';
-    if (enabled && !cached && this.currentClient) {
+    if (this.currentClient) {
       try {
-        const { diff: fetchedDiff } = await this.currentClient.getPullRequestDiff(pr.repo, pr.number);
-        diff = fetchedDiff;
+        const diffResult = await this.fetchDiff(pr, this.currentClient);
+        diff = diffResult.diff;
       } catch (err) {
-        // Unlike the model-streaming loop below, this fetch happens before runCommitSummaryFlow
-        // ever starts — left unguarded, a rejection here (expired/wrong-account credential, a
-        // rate limit, a network blip) throws out of explainPr() entirely with no message ever
-        // posted back to the webview, so the Explain button stays disabled and the skeleton spins
-        // forever with no feedback.
+        // A rejection here (expired credential, rate limit, network blip) throws out of explainPr()
+        // before the flow starts, leaving the Explain button permanently disabled with no feedback.
         const message = err instanceof Error ? err.message : String(err);
         this.logger.error('AI PR explanation failed to fetch the diff', err);
         this.postAiMessage({ type: 'aiSummaryError', message });
@@ -374,12 +497,29 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       }
     }
 
-    const flow = runCommitSummaryFlow({
-      enabled,
-      cached,
+    // Per-file summary cache helpers: key = diffCacheKey(pr) + ':file:' + path.
+    // A new headSha changes the prefix → automatic invalidation of all file entries (E1.3).
+    const fileKeyPrefix = `${cacheKey}:file:`;
+    const getCachedFileSummary = (path: string): string | undefined =>
+      this.fileSummaryCache.get(`${fileKeyPrefix}${path}`);
+    const setCachedFileSummary = (path: string, notes: string): void => {
+      this.fileSummaryCache.set(`${fileKeyPrefix}${path}`, notes);
+    };
+
+    const flow = runReviewFlow({
+      enabled: true, // already checked above
+      diff,
+      maxDiffChars,
       signal: controller.signal,
       selectModel: () => this.languageModelClient.selectModel(modelFamily),
-      buildPrompt: () => buildPrExplanationPrompt(pr, diff, maxDiffChars),
+      // Small diff: single call using the existing prompt (E1.4 "unchanged for small diffs").
+      buildSingleCallPrompt: () => buildPrExplanationPrompt(pr, diff, maxDiffChars),
+      // Large diff: per-file review prompt then explanation synthesis (E1.4).
+      buildFilePrompt: (path, fileDiff) => buildFileReviewPrompt(path, fileDiff, maxDiffChars),
+      buildSynthesisPrompt: (perFileNotes, overflowPaths, skippedPaths) =>
+        buildExplanationSynthesisPrompt(pr, perFileNotes, overflowPaths, skippedPaths),
+      getCachedFileSummary,
+      setCachedFileSummary,
     });
 
     for await (const event of flow) {
@@ -388,18 +528,16 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       }
       switch (event.type) {
         case 'disabled':
-          void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-            if (choice) {
-              void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-            }
-          });
+          // Won't fire: we pass enabled: true. Handled defensively in case the flow is called
+          // directly in tests with enabled: false.
           this.postAiMessage({ type: 'aiSummaryReset' });
-          break;
-        case 'cached':
-          this.postAiMessage({ type: 'aiSummaryCached', text: event.text });
           break;
         case 'noModel':
           this.postAiMessage({ type: 'aiSummaryNoModel', message: describeNoModelReason(vscode.env.appName) });
+          break;
+        case 'progress':
+          // Show per-file progress in the hint area during the map step (E1.4).
+          this.postAiMessage({ type: 'aiSummaryProgress', message: event.message });
           break;
         case 'chunk':
           this.postAiMessage({ type: 'aiSummaryChunk', text: event.text });
@@ -432,22 +570,22 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
     const maxDiffChars = config.get<number>(CONFIG.aiMaxDiffChars, 8000);
 
     // Same guard as explainPr(): checking `enabled` before fetching anything keeps a disabled-AI
-    // click from firing two real network calls to the forge host only to discard both results —
-    // runCommitSummaryFlow's own 'disabled' branch fires too late to protect the fetch below it.
+    // click from firing two real network calls to the forge host only to discard both results.
+    // runReviewFlow's own 'disabled' branch fires too late to protect the fetch below it (E1.3).
     let diff = '';
     let threads: ConversationThread[] = [];
     if (enabled) {
       try {
         const [diffResult, threadsResult] = await Promise.all([
-          client.getPullRequestDiff(pr.repo, pr.number),
+          // Uses the shared diff cache — no extra network call if load() already fetched this diff.
+          this.fetchDiff(pr, client),
           client.listConversationThreads(pr.repo, pr.number),
         ]);
         diff = diffResult.diff;
         threads = threadsResult;
       } catch (err) {
-        // Same failure mode as explainPr()'s diff fetch: unguarded, a rejection here throws out of
-        // draftReview() before runCommitSummaryFlow ever starts, leaving Draft Review disabled
-        // forever with no feedback.
+        // A rejection here throws out of draftReview() before the flow starts, leaving Draft Review
+        // disabled forever with no feedback.
         const message = err instanceof Error ? err.message : String(err);
         this.logger.error('AI PR review draft failed to fetch the diff/threads', err);
         this.postAiMessage({ type: 'draftReviewError', message });
@@ -455,12 +593,29 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       }
     }
 
-    const flow = runCommitSummaryFlow({
+    // Per-file summary cache helpers shared with explainPr (same key prefix → same cache entries).
+    // Re-drafting after resolving a thread reuses file summaries already computed (E1.3).
+    const fileKeyPrefix = `${diffCacheKey(pr)}:file:`;
+    const getCachedFileSummary = (path: string): string | undefined =>
+      this.fileSummaryCache.get(`${fileKeyPrefix}${path}`);
+    const setCachedFileSummary = (path: string, notes: string): void => {
+      this.fileSummaryCache.set(`${fileKeyPrefix}${path}`, notes);
+    };
+
+    const flow = runReviewFlow({
       enabled,
-      cached: undefined,
+      diff,
+      maxDiffChars,
       signal: controller.signal,
       selectModel: () => this.languageModelClient.selectModel(modelFamily),
-      buildPrompt: () => buildPrReviewDraftPrompt(pr, diff, threads, maxDiffChars),
+      // Small diff: single call using the existing prompt — behaviour unchanged (E1.2).
+      buildSingleCallPrompt: () => buildPrReviewDraftPrompt(pr, diff, threads, maxDiffChars),
+      // Large diff: per-file review prompt then synthesis (E1.2).
+      buildFilePrompt: (path, fileDiff) => buildFileReviewPrompt(path, fileDiff, maxDiffChars),
+      buildSynthesisPrompt: (perFileNotes, overflowPaths, skippedPaths) =>
+        buildReviewSynthesisPrompt(pr, perFileNotes, overflowPaths, skippedPaths, threads),
+      getCachedFileSummary,
+      setCachedFileSummary,
     });
 
     for await (const event of flow) {
@@ -469,18 +624,15 @@ export class PullRequestDetailsViewProvider implements vscode.WebviewViewProvide
       }
       switch (event.type) {
         case 'disabled':
-          void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-            if (choice) {
-              void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-            }
-          });
+          void showAiDisabledNotice();
           this.postAiMessage({ type: 'draftReviewReset' });
-          break;
-        case 'cached':
-          // Never reached: this flow always passes cached: undefined.
           break;
         case 'noModel':
           this.postAiMessage({ type: 'draftReviewNoModel', message: describeNoModelReason(vscode.env.appName) });
+          break;
+        case 'progress':
+          // Per-file progress during the map step — shown as an aria-live status line (E1.2).
+          this.postAiMessage({ type: 'draftReviewProgress', message: event.message });
           break;
         case 'chunk':
           this.postAiMessage({ type: 'draftReviewChunk', text: event.text });

@@ -203,6 +203,171 @@ h1 {
   margin: 0;
 }
 
+/* ---------- Review body textarea ---------- */
+
+/* Hidden until the user focuses Approve/Request Changes — keeps the action bar
+   uncluttered for the common one-click path. */
+.review-body-form {
+  flex: 0 0 auto;
+  padding: 0 0.75rem 0.35rem;
+}
+
+.review-body-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 2.8em;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-input-foreground);
+  background-color: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: var(--gitlore-radius-md);
+  padding: 0.4rem;
+}
+
+.review-body-form textarea:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* ---------- Checks section ---------- */
+
+.checks {
+  flex: 0 1 auto;
+  overflow: auto;
+  max-height: 25%;
+  padding: 0.3rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.92em;
+  padding: 0.15rem 0;
+}
+
+.check-row.check-failing .status-icon {
+  color: var(--gl-danger);
+}
+
+.check-row.check-passing .status-icon {
+  color: var(--gl-success);
+}
+
+.check-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check-link {
+  flex: 0 0 auto;
+}
+
+.check-passing-count {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.92em;
+  color: var(--vscode-descriptionForeground);
+  padding: 0.15rem 0;
+}
+
+.error-inline {
+  margin: 0;
+  padding: 0.25rem 0;
+  font-size: 0.9em;
+  color: var(--gl-danger);
+}
+
+/* ---------- Thread enhancements (B2.3) ---------- */
+
+/* A thread now shows all comments, not just the first one. Each comment is stacked
+   with a small separator above all but the first. */
+.thread-comment + .thread-comment {
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: 0.25rem;
+  margin-top: 0.25rem;
+}
+
+.thread-comment-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+  margin-top: 0.15rem;
+}
+
+.thread-comment-time {
+  color: var(--vscode-descriptionForeground);
+}
+
+/* Reply box inside a thread — visually lighter than the PR-level comment box. */
+.thread-reply {
+  margin-top: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.thread-reply textarea {
+  resize: vertical;
+  min-height: 2.5em;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-input-foreground);
+  background-color: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: var(--gitlore-radius-md);
+  padding: 0.3rem;
+}
+
+.thread-reply textarea:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.thread-reply-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Jump-to-line button in the thread location (B5.1) — styled as a subtle code-like link. */
+button.thread-location {
+  all: unset;
+  cursor: pointer;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.85em;
+  color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
+  margin-bottom: 0.2rem;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+button.thread-location:hover:not([disabled]) {
+  text-decoration: underline;
+}
+
+button.thread-location[disabled] {
+  cursor: default;
+  opacity: 0.6;
+}
+
+button.thread-location:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  border-radius: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;

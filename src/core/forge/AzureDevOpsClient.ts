@@ -4,6 +4,7 @@ import type { ForgeClient } from './ForgeClient';
 import { splitAzureDevOpsIdentity } from './azureDevOpsIdentity';
 import { forgeFetch, ForgeHttpError, mapWithConcurrency, MAX_PAGES, sameLogin } from './forgeFetch';
 import type {
+  CheckDetail,
   CheckStatus,
   ConversationThread,
   CreatePullRequestOptions,
@@ -14,6 +15,7 @@ import type {
   PullRequestSummary,
   ReviewDecision,
   ReviewSubmission,
+  ThreadComment,
 } from './types';
 
 interface AzureDevOpsIdentityRef {
@@ -46,6 +48,12 @@ interface AzureDevOpsStatus {
   state: 'succeeded' | 'error' | 'failed' | 'pending' | 'notApplicable' | 'notSet';
 }
 
+interface AzureDevOpsStatusDetail {
+  context?: { name?: string };
+  targetUrl?: string;
+  state: 'succeeded' | 'error' | 'failed' | 'pending' | 'notApplicable' | 'notSet';
+}
+
 interface AzureDevOpsProfile {
   id?: string;
   emailAddress?: string;
@@ -74,8 +82,10 @@ interface AzureDevOpsIterationChanges {
 type AzureDevOpsThreadStatus = 'unknown' | 'active' | 'fixed' | 'wontFix' | 'closed' | 'byDesign' | 'pending';
 
 interface AzureDevOpsThreadComment {
+  id?: number;
   content: string;
   author: AzureDevOpsIdentityRef;
+  publishedDate?: string;
   /** Vote-change notifications and similar auto-generated entries come through as their own threads with `commentType: 'system'` — not a genuine review conversation. */
   commentType?: 'text' | 'codeChange' | 'system' | 'unknown';
 }
@@ -120,6 +130,12 @@ function computeCheckStatus(statuses: AzureDevOpsStatus[]): CheckStatus {
   if (statuses.some((s) => s.state === 'error' || s.state === 'failed')) {
     return 'failing';
   }
+  return 'passing';
+}
+
+function toStatusCheckStatus(state: AzureDevOpsStatusDetail['state']): CheckStatus {
+  if (state === 'pending') return 'pending';
+  if (state === 'error' || state === 'failed') return 'failing';
   return 'passing';
 }
 
@@ -263,6 +279,7 @@ export class AzureDevOpsClient implements ForgeClient {
       isDraft: false,
       createdAt: pr.creationDate,
       updatedAt: pr.closedDate ?? pr.creationDate,
+      headSha: pr.lastMergeSourceCommit?.commitId ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
@@ -322,9 +339,8 @@ export class AzureDevOpsClient implements ForgeClient {
     if (!latest) {
       return { files: [], diff: '' };
     }
-    const changesRes = await this.request(`${base}/pullrequests/${number}/iterations/${latest.id}/changes?api-version=7.1`);
-    const changes = (await changesRes.json()) as AzureDevOpsIterationChanges;
-    const entries = changes.changeEntries.filter((entry): entry is AzureDevOpsChangeEntry & { item: { path: string } } => !!entry.item?.path);
+    const changes = await this.fetchIterationChanges(base, number, latest.id);
+    const entries = changes.filter((entry): entry is AzureDevOpsChangeEntry & { item: { path: string } } => !!entry.item?.path);
 
     const targetCommit = latest.sourceRefCommit?.commitId;
     const baseCommit = latest.commonRefCommit?.commitId;
@@ -400,8 +416,11 @@ export class AzureDevOpsClient implements ForgeClient {
     return res ? await res.text() : null;
   }
 
-  /** The reviewer being voted on is the authenticated user themselves — reuses the same `authenticatedUserId` `getAuthenticatedLogin` already caches for `searchCriteria.creatorId` (`AzureDevOpsClient.ts` constructor field), rather than a second profile lookup. */
-  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission): Promise<void> {
+  /**
+   * The reviewer being voted on is the authenticated user themselves. When `body` is provided, it
+   * is posted as a new thread comment before the vote — failure blocks the vote, same as GitLab/Bitbucket.
+   */
+  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission, body?: string): Promise<void> {
     const id = splitAzureDevOpsIdentity(repo.identity);
     if (!id) {
       throw new Error('could not resolve this repo\'s Azure DevOps organization/project/repository identity');
@@ -410,6 +429,12 @@ export class AzureDevOpsClient implements ForgeClient {
       throw new Error('not signed in yet — refresh Launchpad and try again');
     }
     const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
+    if (body && body.trim().length > 0) {
+      await this.request(`${base}/pullrequests/${number}/threads?api-version=7.1`, {
+        method: 'POST',
+        body: JSON.stringify({ comments: [{ parentCommentId: 0, content: body, commentType: 1 }], status: 1 }),
+      });
+    }
     await this.request(`${base}/pullrequests/${number}/reviewers/${this.authenticatedUserId}?api-version=7.1`, {
       method: 'PUT',
       body: JSON.stringify({ vote: decision === 'approve' ? 10 : -10 }),
@@ -429,24 +454,31 @@ export class AzureDevOpsClient implements ForgeClient {
     });
   }
 
-  /** Excludes deleted threads and system-generated ones (vote-change notifications, etc. — `commentType: 'system'`) so this only ever lists genuine review conversations. */
+  /** Excludes deleted threads and system-generated ones (vote-change notifications, etc. — `commentType: 'system'`) so this only ever lists genuine review conversations. Paginated via `fetchAllSkip`. */
   async listConversationThreads(repo: ForgeRepoRef, number: number): Promise<ConversationThread[]> {
     const id = splitAzureDevOpsIdentity(repo.identity);
     if (!id) {
       return [];
     }
     const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
-    const res = await this.request(`${base}/pullrequests/${number}/threads?api-version=7.1`);
-    const data = (await res.json()) as AzureDevOpsListResponse<AzureDevOpsThread>;
-    return data.value
+    const threads = await this.fetchAllSkip<AzureDevOpsThread>(`${base}/pullrequests/${number}/threads?api-version=7.1`);
+    return threads
       .filter((t) => !t.isDeleted && t.comments[0]?.commentType !== 'system')
       .map((t) => {
         const line = t.threadContext?.rightFileStart?.line ?? t.threadContext?.leftFileStart?.line ?? undefined;
+        const comments: ThreadComment[] = t.comments
+          .filter((c) => c.commentType !== 'system')
+          .map((c) => ({
+            authorLogin: loginOf(c.author),
+            body: c.content,
+            ...(c.publishedDate ? { createdAt: c.publishedDate } : {}),
+          }));
         return {
           id: String(t.id),
           body: t.comments[0]?.content ?? '',
           authorLogin: t.comments[0] ? loginOf(t.comments[0].author) : '',
           resolved: !UNRESOLVED_STATUSES.has(t.status),
+          comments,
           ...(t.threadContext?.filePath !== undefined ? { file: t.threadContext.filePath } : {}),
           ...(line !== undefined ? { line } : {}),
         };
@@ -464,6 +496,97 @@ export class AzureDevOpsClient implements ForgeClient {
       method: 'PATCH',
       body: JSON.stringify({ status: 'fixed' }),
     });
+  }
+
+  /** Adds a reply to an existing thread. `parentCommentId: 1` points to the first (root) comment, which is the convention Azure DevOps uses for a direct reply to the thread. */
+  async replyToThread(repo: ForgeRepoRef, number: number, threadId: string, body: string): Promise<void> {
+    const id = splitAzureDevOpsIdentity(repo.identity);
+    if (!id) {
+      throw new Error('could not resolve this repo\'s Azure DevOps organization/project/repository identity');
+    }
+    const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
+    await this.request(`${base}/pullrequests/${number}/threads/${threadId}/comments?api-version=7.1`, {
+      method: 'POST',
+      body: JSON.stringify({ parentCommentId: 1, content: body, commentType: 1 }),
+    });
+  }
+
+  /** Sets thread status to `"active"` — Azure DevOps' way of unresolving a fixed/wontFix thread. */
+  async unresolveConversationThread(repo: ForgeRepoRef, number: number, threadId: string): Promise<void> {
+    const id = splitAzureDevOpsIdentity(repo.identity);
+    if (!id) {
+      throw new Error('could not resolve this repo\'s Azure DevOps organization/project/repository identity');
+    }
+    const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
+    await this.request(`${base}/pullrequests/${number}/threads/${threadId}?api-version=7.1`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'active' }),
+    });
+  }
+
+  /** Lists PR statuses as check details, paginated via `fetchAllSkip`. Uses `context.name` as the display name and `targetUrl` as the link. */
+  async listChecks(repo: ForgeRepoRef, number: number): Promise<CheckDetail[]> {
+    const id = splitAzureDevOpsIdentity(repo.identity);
+    if (!id) {
+      return [];
+    }
+    const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
+    const statuses = await this.fetchAllSkip<AzureDevOpsStatusDetail>(`${base}/pullRequests/${number}/statuses?api-version=7.1`);
+    return statuses.map((s) => ({
+      name: s.context?.name ?? 'unknown',
+      status: toStatusCheckStatus(s.state),
+      ...(s.targetUrl ? { url: s.targetUrl } : {}),
+    }));
+  }
+
+  /**
+   * One page only — a commit is in very few PRs. Two query types are sent in a single POST:
+   * `lastMergeCommit` (finds completed/merged PRs whose merge commit equals the SHA) and `commit`
+   * (finds active PRs that contain the commit). Results from `lastMergeCommit` are preferred.
+   * 404 means the repo or commit is unknown to this Azure DevOps instance — treated as null.
+   *
+   * Implemented as documented at:
+   * https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-query/get
+   * (body: `{ queries: [{ type, items }] }`, response: `{ results: [{ sha: [pr, ...] }] }`)
+   */
+  async findPullRequestForCommit(repo: ForgeRepoRef, sha: string): Promise<{ number: number; title: string; url: string } | null> {
+    const id = splitAzureDevOpsIdentity(repo.identity);
+    if (!id) {
+      return null;
+    }
+    const base = `https://dev.azure.com/${id.organization}/${id.project}/_apis/git/repositories/${id.repository}`;
+    try {
+      const res = await this.request(`${base}/pullrequestquery?api-version=7.1`, {
+        method: 'POST',
+        body: JSON.stringify({
+          queries: [
+            { type: 'lastMergeCommit', items: [sha] },
+            { type: 'commit', items: [sha] },
+          ],
+        }),
+      });
+      const data = (await res.json()) as {
+        results: Array<Record<string, Array<{ pullRequestId: number; title: string }>>>;
+      };
+      // results[0] = lastMergeCommit (completed/merged PRs, preferred), results[1] = commit (all types).
+      for (const resultSet of data.results) {
+        const prs = resultSet[sha] ?? [];
+        const pr = prs[0];
+        if (pr) {
+          return {
+            number: pr.pullRequestId,
+            title: pr.title,
+            url: `https://dev.azure.com/${id.organization}/${id.project}/_git/${id.repository}/pullrequest/${pr.pullRequestId}`,
+          };
+        }
+      }
+      return null;
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -522,6 +645,7 @@ export class AzureDevOpsClient implements ForgeClient {
       isDraft: data.isDraft ?? options.draft,
       createdAt: data.creationDate,
       updatedAt: data.creationDate,
+      headSha: data.lastMergeSourceCommit?.commitId ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
@@ -547,6 +671,7 @@ export class AzureDevOpsClient implements ForgeClient {
       isDraft: pr.isDraft ?? false,
       createdAt: pr.creationDate,
       updatedAt: pr.creationDate,
+      headSha: pr.lastMergeSourceCommit?.commitId ?? '',
       requestedReviewers,
       checkStatus: computeCheckStatus(statuses),
       reviewDecision,
@@ -556,12 +681,14 @@ export class AzureDevOpsClient implements ForgeClient {
   }
 
   private async fetchStatuses(base: string, pullRequestId: number): Promise<AzureDevOpsStatus[]> {
-    const res = await this.requestOrNull(`${base}/pullRequests/${pullRequestId}/statuses?api-version=7.1`);
-    if (!res) {
-      return [];
+    try {
+      return await this.fetchAllSkip<AzureDevOpsStatus>(`${base}/pullRequests/${pullRequestId}/statuses?api-version=7.1`);
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return [];
+      }
+      throw err;
     }
-    const data = (await res.json()) as AzureDevOpsListResponse<AzureDevOpsStatus>;
-    return data.value ?? [];
   }
 
   /** Azure DevOps paginates with `$top` + `$skip` (no Link header, no body `next`). Stops at `MAX_PAGES` pages to match the ceiling in `forgeFetch`. A short page (< top) signals the last page. */
@@ -578,7 +705,26 @@ export class AzureDevOpsClient implements ForgeClient {
     return all;
   }
 
-  /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. Only `fetchStatuses` wraps this in `requestOrNull` — a single PR's check-status enrichment failing shouldn't take down the whole list the way a credential problem on the list call itself should be visible. */
+  /**
+   * The iteration changes endpoint returns `{ changeEntries: [...] }` not `{ value: [...] }`, so
+   * `fetchAllSkip` (which reads `value`) can't be reused here — this is its own `MAX_PAGES` loop
+   * reading `changeEntries` instead.
+   */
+  private async fetchIterationChanges(base: string, prId: number, iterationId: number): Promise<AzureDevOpsChangeEntry[]> {
+    const top = 100;
+    const all: AzureDevOpsChangeEntry[] = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const res = await this.request(
+        `${base}/pullrequests/${prId}/iterations/${iterationId}/changes?$top=${top}&$skip=${page * top}&api-version=7.1`,
+      );
+      const data = (await res.json()) as AzureDevOpsIterationChanges;
+      all.push(...(data.changeEntries ?? []));
+      if ((data.changeEntries?.length ?? 0) < top) break;
+    }
+    return all;
+  }
+
+  /** Throws with the real reason (HTTP status or network failure) instead of swallowing it. `requestOrNull` wraps this for best-effort calls where a 404 is a valid "absent" signal. */
   private async request(url: string, init?: RequestInit): Promise<Response> {
     // A PAT authenticates via HTTP Basic with an empty username — Bearer support for raw PATs
     // isn't consistently documented the way it is for GitHub/GitLab/Bitbucket tokens. An AAD OAuth

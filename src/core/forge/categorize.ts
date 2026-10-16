@@ -18,7 +18,9 @@ function bucketFor(pr: PullRequestSummary, myLogin: string, snoozed: boolean): L
   if (!sameLogin(pr.authorLogin, myLogin) && pr.reviewedByMe && !pr.requestedReviewers.some((r) => sameLogin(r, myLogin))) {
     return 'reviewed';
   }
-  if (pr.checkStatus === 'failing' || pr.reviewDecision === 'changesRequested' || pr.hasConflicts) {
+  // blocked only for PRs you authored — a PR you don't own with failing CI / changes requested /
+  // conflicts is still actionable for you as a reviewer (your job is to review it, not fix it).
+  if (sameLogin(pr.authorLogin, myLogin) && (pr.checkStatus === 'failing' || pr.reviewDecision === 'changesRequested' || pr.hasConflicts)) {
     return 'blocked';
   }
   // Still in requestedReviewers means I haven't submitted a review yet — GitHub (and the other

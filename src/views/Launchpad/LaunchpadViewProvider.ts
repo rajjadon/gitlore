@@ -1,12 +1,10 @@
 import * as vscode from 'vscode';
 import { GitService } from '../../core/git/GitService';
 import type { GitLogger } from '../../core/git/errors';
-import { parseRemoteUrl } from '../../core/git/parsers';
 import { buildForgeClient } from '../../core/forge/buildForgeClient';
-import { loadBoard, recategorize, pruneSnoozed, collectLivePrKeys, type BoardRepoInput } from '../../core/forge/loadBoard';
-import { detectForgeHost, type DetectedForgeHost, type ForgeHostConfig } from '../../core/forge/hostDetection';
+import { loadBoard, recategorize, collectLivePrKeys, type BoardRepoInput } from '../../core/forge/loadBoard';
+import { type DetectedForgeHost, type ForgeHostConfig } from '../../core/forge/hostDetection';
 import type { ForgeClient } from '../../core/forge/ForgeClient';
-import { resolveForgeRepoRef } from '../../core/forge/resolveRepoRef';
 import {
   pullRequestKey,
   type ForgeRepoRef,
@@ -17,12 +15,26 @@ import {
 import { azureDevOpsCredentialScheme, clearForgeToken, resolveForgeToken, signOutOfForgeHost } from '../../providers/forgeCredentials';
 import { renderLaunchpadHtml, type LaunchpadRepoError, type LaunchpadRepoRow } from './render';
 import { renderPlaceholderHtml } from '../placeholder';
-import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
+import { COMMANDS, CONFIG, MEDIA, SNOOZE_STATE_KEY, VIEWS } from '../../constants';
 import { runInGitSyncTerminal } from '../gitSyncTerminal';
 import { closePullRequestFlow, mergePullRequestFlow, reopenPullRequestFlow, submitReviewFlow, type PullRequestActionUi } from '../pullRequestActions';
 import { vscodePullRequestActionUi } from '../pullRequestActionUi';
+import {
+  migrateSnoozeState,
+  isSnoozedNow,
+  snoozeUntil,
+  unsnooze,
+  pruneSnoozed,
+  stampLegacySnoozes,
+  type SnoozeStore,
+  type SnoozeChoice,
+} from '../../core/forge/snoozeStore';
+import { createRefreshThrottle } from '../../core/forge/refreshThrottle';
+import { setBoardSummary, getBoardSummary, buildBoardSummary, withBoardLoad } from '../../core/forge/boardSummaryStore';
+import { resolveWorkspaceForgeRepos } from '../../providers/workspaceForgeRepos';
 
-const SNOOZE_STATE_KEY = 'gitLore.launchpad.snoozed';
+/** 60 s minimum between focus-triggered refreshes — matches the contract's ≥ 60 s requirement. */
+const FOCUS_REFRESH_MIN_INTERVAL_MS = 60_000;
 
 /** Returns a PullRequestActionUi that auto-confirms the first matching button — used by ForTest methods so integration tests exercise real flow logic without driving an interactive modal. */
 function autoConfirmUi(confirmButton: string): PullRequestActionUi {
@@ -44,14 +56,7 @@ function autoMergeUi(strategy: MergeStrategy, deleteSourceBranch: boolean): Pull
   };
 }
 
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
+import { createNonce } from '../nonce';
 
 /**
  * A cross-repo PR triage board, in a full editor tab (like Rebase Editor — a 6-column board needs
@@ -75,10 +80,21 @@ export class LaunchpadViewProvider implements vscode.Disposable {
   private repoLabelByKey = new Map<string, string>();
   /** Rebuilt on every refresh — the signed-in login per repo, so `submitReview` can catch "you're reviewing your own PR" before ever calling the host's API. Every host we support rejects a self-review one way or another; catching it here turns that into one clear message instead of a different opaque API error per host. */
   private loginByRepoKey = new Map<string, string>();
-  /** The last full-load raw PR data per repo — lets `recategorize` re-bucket without a network call (e.g. after toggling snooze). */
+  /** The last full-load raw PR data per repo — lets `recategorize` re-bucket without a network call (e.g. after toggling snooze). Also passed to `loadBoard` as `previousByRepoKey` so a repo that fails during a refresh still shows its last known PRs as stale. */
   private rawByRepoKey: Map<string, { login: string; open: PullRequestSummary[]; closed: PullRequestSummary[] }> = new Map();
   private cachedErrors: Array<{ repo: ForgeRepoRef; message: string }> = [];
   private cachedRepoRows: LaunchpadRepoRow[] = [];
+
+  /** When the last successful full-board load completed — used for focus-refresh throttling and the "Updated N ago" header. */
+  private lastLoadedAt: Date | undefined;
+  /** True while a refresh is in-flight — prevents concurrent focus-triggered refreshes. */
+  private refreshInFlight = false;
+
+  /** Throttle for focus-triggered refreshes — shared so it's consistent even if the panel is replaced. */
+  private readonly focusThrottle = createRefreshThrottle(FOCUS_REFRESH_MIN_INTERVAL_MS);
+
+  /** Disposable for the window-focus listener — created when the panel opens, disposed when the panel closes. */
+  private focusListenerDisposable: vscode.Disposable | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -92,6 +108,8 @@ export class LaunchpadViewProvider implements vscode.Disposable {
 
   dispose(): void {
     this.panel?.dispose();
+    this.focusListenerDisposable?.dispose();
+    this.focusListenerDisposable = undefined;
   }
 
   /** Test-only injection seam, since the extension host constructs one long-lived instance with the real `fetch` — a test needs to swap it after the fact, not at construction. */
@@ -115,9 +133,28 @@ export class LaunchpadViewProvider implements vscode.Disposable {
       });
       this.panel.onDidDispose(() => {
         this.panel = undefined;
+        // Dispose the focus listener when the panel closes — it only makes sense while the panel is open.
+        this.focusListenerDisposable?.dispose();
+        this.focusListenerDisposable = undefined;
       });
       this.panel.webview.onDidReceiveMessage((message: unknown) => {
         void this.handleMessage(message);
+      });
+
+      // C1.1: Refresh on window focus, throttled to ≥ 60 s and never while in-flight.
+      // Panel-scoped (not in context.subscriptions) because refreshing when no panel is open would
+      // be wasted work; disposing it with the panel keeps it tightly coupled to panel lifetime.
+      // Defensive: dispose any existing listener first so opening the panel twice never leaks one.
+      this.focusListenerDisposable?.dispose();
+      this.focusListenerDisposable = vscode.window.onDidChangeWindowState((state) => {
+        if (!state.focused) {
+          return;
+        }
+        if (!this.focusThrottle.shouldRefresh(this.refreshInFlight, this.lastLoadedAt?.getTime())) {
+          return;
+        }
+        // Focus refresh: no loading flash (showLoadingPlaceholder = false)
+        void this.refresh(false);
       });
     }
     await this.refresh();
@@ -138,95 +175,135 @@ export class LaunchpadViewProvider implements vscode.Disposable {
     if (!this.panel) {
       return;
     }
-    const styleUris = [this.mediaUri(MEDIA.shared), this.mediaUri(MEDIA.launchpad)];
-    const renderOpts = { nonce: createNonce(), cspSource: this.panel.webview.cspSource, styleUris };
-    if (showLoadingPlaceholder) {
-      this.panel.webview.html = renderPlaceholderHtml('Loading Launchpad…', { ...renderOpts, variant: 'loading' });
-    }
+    // Capture panel into a local const so TypeScript narrows it to non-undefined inside async
+    // callbacks (the class field can be reset to undefined by onDidDispose at any await point).
+    const panel = this.panel;
+    this.refreshInFlight = true;
+    try {
+      // withBoardLoad: signals in-flight to LaunchpadStatusBar (prevents duplicate loads) and
+      // guarantees markLoadFinished() runs in its finally — even on early return or thrown error,
+      // so _loadInFlight never gets stuck (Bug 1 fix).
+      await withBoardLoad(async () => {
+      const styleUris = [this.mediaUri(MEDIA.shared), this.mediaUri(MEDIA.launchpad)];
+      const renderOpts = { nonce: createNonce(), cspSource: panel.webview.cspSource, styleUris };
+      if (showLoadingPlaceholder) {
+        panel.webview.html = renderPlaceholderHtml('Loading Launchpad…', { ...renderOpts, variant: 'loading' });
+      }
 
-    const customHosts = this.readCustomHosts();
-    const repos = await this.resolveWorkspaceRepos(customHosts);
-    if (repos.length === 0) {
-      this.panel.webview.html = renderPlaceholderHtml(
-        'No recognized git-forge remotes found in this workspace — GitHub, GitLab, Bitbucket, and Azure DevOps are supported out of the box; anything else needs an entry in gitLore.launchpad.customHosts.',
+      const customHosts = this.readCustomHosts();
+      const folderPaths = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+      const repos = await resolveWorkspaceForgeRepos(this.git, folderPaths, customHosts);
+      if (repos.length === 0) {
+        panel.webview.html = renderPlaceholderHtml(
+          'No recognized git-forge remotes found in this workspace — GitHub, GitLab, Bitbucket, and Azure DevOps are supported out of the box; anything else needs an entry in gitLore.launchpad.customHosts.',
+          renderOpts,
+        );
+        return;
+      }
+
+      // Resolve tokens sequentially — resolveForgeToken may show an input box, and parallelizing
+      // it would stack several prompts at once on a multi-root workspace.
+      const newClientsByRepoKey = new Map<string, ForgeClient>();
+      const newRepoRootByKey = new Map<string, string>();
+      const newDetectedByRepoKey = new Map<string, DetectedForgeHost>();
+      const newRepoLabelByKey = new Map<string, string>();
+      const repoRows: LaunchpadRepoRow[] = [];
+      const boardInputs: BoardRepoInput[] = [];
+
+      for (const { repo, detected, repoRoot } of repos) {
+        const key = `${repo.host}:${repo.identity}`;
+        newRepoRootByKey.set(key, repoRoot);
+        newDetectedByRepoKey.set(key, detected);
+        newRepoLabelByKey.set(key, repo.label);
+        repoRows.push({ key, label: repo.label });
+
+        const token = await resolveForgeToken(this.context.secrets, detected);
+        if (!token) {
+          boardInputs.push({ repo, client: null, displayHost: detected.displayHost });
+          continue;
+        }
+        const client = buildForgeClient(
+          detected.flavor,
+          detected.apiBaseUrl,
+          repo.identity,
+          token,
+          azureDevOpsCredentialScheme(detected),
+          this.fetchImpl,
+        );
+        newClientsByRepoKey.set(key, client);
+        boardInputs.push({ repo, client, displayHost: detected.displayHost });
+      }
+
+      const result = await loadBoard({
+        repos: boardInputs,
+        isSnoozed: (pr) => this.isSnoozed(pr),
+        onCredentialRejected: async (repo) => {
+          const detected = newDetectedByRepoKey.get(`${repo.host}:${repo.identity}`);
+          if (detected) {
+            await clearForgeToken(this.context.secrets, detected);
+          }
+        },
+        logError: (msg, err) => this.logger?.error(msg, err),
+        // Pass previous data so failed repos still show their last known PRs as stale
+        previousByRepoKey: this.rawByRepoKey,
+      });
+
+      // Swap out all instance state atomically so actions that look up a PR or client
+      // always see a consistent snapshot.
+      this.clientsByRepoKey = newClientsByRepoKey;
+      this.loginByRepoKey = result.loginByRepoKey;
+      this.repoRootByKey = newRepoRootByKey;
+      this.detectedByRepoKey = newDetectedByRepoKey;
+      this.repoLabelByKey = newRepoLabelByKey;
+      this.rawByRepoKey = result.rawByRepoKey;
+      this.cachedErrors = result.errors;
+      this.cachedRepoRows = repoRows;
+      this.lastLoadedAt = new Date();
+
+      // D1.4: Push needsReview summary to boardSummaryStore so LaunchpadStatusBar can update
+      // without a second network call. buildBoardSummary is the single shared implementation of
+      // the counting/stale rules (Bug 2 fix: partial failures are now marked stale; total failure
+      // preserves previous data rather than reporting a false "0").
+      setBoardSummary(buildBoardSummary(result, getBoardSummary(), this.lastLoadedAt.getTime()));
+
+      // Populate prsByKey from the raw data — merged/closed PRs need it too (View diff, Reopen).
+      this.prsByKey = new Map();
+      for (const { open, closed } of result.rawByRepoKey.values()) {
+        for (const pr of [...open, ...closed]) {
+          this.prsByKey.set(pullRequestKey(pr), pr);
+        }
+      }
+
+      // Build prsByKey for legacy snooze stamping — all PRs from this load's raw data.
+      const prsByKeyForStamp = new Map<string, { updatedAt: string }>();
+      for (const { open, closed } of result.rawByRepoKey.values()) {
+        for (const pr of [...open, ...closed]) {
+          prsByKeyForStamp.set(pullRequestKey(pr), { updatedAt: pr.updatedAt });
+        }
+      }
+
+      // Stamp legacy snoozes (migrated from old string[] format) with the current PR updatedAt —
+      // converts { legacy: true } → { updatedAt } "until changed" entries for known PRs.
+      // Then prune keys for PRs that are confirmed gone from a successfully-refreshed repo.
+      // Snoozes from repos that FAILED to refresh are never pruned — we don't know if those PRs
+      // still exist.
+      const refreshedRepoKeys = new Set(result.rawByRepoKey.keys());
+      const livePrKeys = collectLivePrKeys(result.rawByRepoKey);
+      const stampedStore = stampLegacySnoozes(this.readSnoozeStore(), prsByKeyForStamp);
+      const prunedStore = pruneSnoozed(stampedStore, livePrKeys, refreshedRepoKeys);
+      await this.context.globalState.update(SNOOZE_STATE_KEY, prunedStore);
+
+      if (!this.panel) {
+        return;
+      }
+      panel.webview.html = renderLaunchpadHtml(
+        { categorized: result.categorized, errors: result.errors, repoRows, lastLoadedAt: this.lastLoadedAt },
         renderOpts,
       );
-      return;
+      }); // end withBoardLoad
+    } finally {
+      this.refreshInFlight = false;
     }
-
-    // Resolve tokens sequentially — resolveForgeToken may show an input box, and parallelizing
-    // it would stack several prompts at once on a multi-root workspace.
-    const newClientsByRepoKey = new Map<string, ForgeClient>();
-    const newRepoRootByKey = new Map<string, string>();
-    const newDetectedByRepoKey = new Map<string, DetectedForgeHost>();
-    const newRepoLabelByKey = new Map<string, string>();
-    const repoRows: LaunchpadRepoRow[] = [];
-    const boardInputs: BoardRepoInput[] = [];
-
-    for (const { repo, detected, repoRoot } of repos) {
-      const repoKey = `${repo.host}:${repo.identity}`;
-      newRepoRootByKey.set(repoKey, repoRoot);
-      newDetectedByRepoKey.set(repoKey, detected);
-      newRepoLabelByKey.set(repoKey, repo.label);
-      repoRows.push({ key: repoKey, label: repo.label });
-
-      const token = await resolveForgeToken(this.context.secrets, detected);
-      if (!token) {
-        boardInputs.push({ repo, client: null, displayHost: detected.displayHost });
-        continue;
-      }
-      const client = buildForgeClient(
-        detected.flavor,
-        detected.apiBaseUrl,
-        repo.identity,
-        token,
-        azureDevOpsCredentialScheme(detected),
-        this.fetchImpl,
-      );
-      newClientsByRepoKey.set(repoKey, client);
-      boardInputs.push({ repo, client, displayHost: detected.displayHost });
-    }
-
-    const result = await loadBoard({
-      repos: boardInputs,
-      isSnoozed: (pr) => this.isSnoozed(pr),
-      onCredentialRejected: async (repo) => {
-        const detected = newDetectedByRepoKey.get(`${repo.host}:${repo.identity}`);
-        if (detected) {
-          await clearForgeToken(this.context.secrets, detected);
-        }
-      },
-      logError: (msg, err) => this.logger?.error(msg, err),
-    });
-
-    // Swap out all instance state atomically so actions that look up a PR or client
-    // always see a consistent snapshot.
-    this.clientsByRepoKey = newClientsByRepoKey;
-    this.loginByRepoKey = result.loginByRepoKey;
-    this.repoRootByKey = newRepoRootByKey;
-    this.detectedByRepoKey = newDetectedByRepoKey;
-    this.repoLabelByKey = newRepoLabelByKey;
-    this.rawByRepoKey = result.rawByRepoKey;
-    this.cachedErrors = result.errors;
-    this.cachedRepoRows = repoRows;
-
-    // Populate prsByKey from the raw data — merged/closed PRs need it too (View diff, Reopen).
-    this.prsByKey = new Map();
-    for (const { open, closed } of result.rawByRepoKey.values()) {
-      for (const pr of [...open, ...closed]) {
-        this.prsByKey.set(pullRequestKey(pr), pr);
-      }
-    }
-
-    // Prune snoozed keys that belong to PRs no longer in the board — keeps globalState tidy (L7).
-    const livePrKeys = collectLivePrKeys(result.rawByRepoKey);
-    const prunedSnoozed = pruneSnoozed(this.readSnoozed(), livePrKeys);
-    await this.context.globalState.update(SNOOZE_STATE_KEY, prunedSnoozed);
-
-    if (!this.panel) {
-      return;
-    }
-    this.panel.webview.html = renderLaunchpadHtml({ categorized: result.categorized, errors: result.errors, repoRows }, renderOpts);
   }
 
   /** Re-renders the board from cached raw data — no network call. Used after snooze toggling (L6). */
@@ -237,75 +314,87 @@ export class LaunchpadViewProvider implements vscode.Disposable {
     const categorized = recategorize(this.rawByRepoKey, (pr) => this.isSnoozed(pr));
     const styleUris = [this.mediaUri(MEDIA.shared), this.mediaUri(MEDIA.launchpad)];
     const renderOpts = { nonce: createNonce(), cspSource: this.panel.webview.cspSource, styleUris };
-    this.panel.webview.html = renderLaunchpadHtml({ categorized, errors: this.cachedErrors, repoRows: this.cachedRepoRows }, renderOpts);
+    this.panel.webview.html = renderLaunchpadHtml({
+      categorized,
+      errors: this.cachedErrors,
+      repoRows: this.cachedRepoRows,
+      lastLoadedAt: this.lastLoadedAt,
+    }, renderOpts);
   }
 
   private readCustomHosts(): ForgeHostConfig[] {
     return vscode.workspace.getConfiguration(CONFIG.section).get<ForgeHostConfig[]>(CONFIG.launchpadCustomHosts, []);
   }
 
-  /** Every workspace folder's git remote, resolved to a forge repo — deduped, since a multi-root workspace can have several folders pointing at the same repo. */
-  /**
-   * Every *named* remote in every workspace folder — not just `origin`. A fork's `upstream`, a
-   * second `origin`-like remote, or anything else the user has added all get scanned the same
-   * way, deduped by resolved repo identity (two remotes, or two workspace folders, can easily
-   * point at the same actual repo). Credentials are still resolved once per *host*, not per
-   * remote, so having several remotes on the same host never means re-authenticating per remote.
-   */
-  private async resolveWorkspaceRepos(
-    customHosts: ForgeHostConfig[],
-  ): Promise<Array<{ repo: ForgeRepoRef; detected: DetectedForgeHost; repoRoot: string }>> {
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    const results: Array<{ repo: ForgeRepoRef; detected: DetectedForgeHost; repoRoot: string }> = [];
-    const seen = new Set<string>();
-
-    for (const folder of folders) {
-      const repoRoot = await this.git.getRepoRoot(folder.uri.fsPath);
-      if (!repoRoot) {
-        continue;
-      }
-      const remotes = await this.git.getRemotes(repoRoot);
-      for (const remote of remotes) {
-        const parsedHost = parseRemoteUrl(remote.url)?.host;
-        if (!parsedHost) {
-          continue;
-        }
-        const detected = detectForgeHost(parsedHost, customHosts);
-        if (!detected) {
-          continue;
-        }
-        const repo = resolveForgeRepoRef(remote.url, customHosts);
-        if (!repo) {
-          continue;
-        }
-        const key = `${repo.host}:${repo.identity}`;
-        if (seen.has(key)) {
-          continue;
-        }
-        seen.add(key);
-        results.push({ repo, detected, repoRoot });
-      }
-    }
-    return results;
-  }
-
   private isSnoozed(pr: PullRequestSummary): boolean {
-    return this.readSnoozed().includes(pullRequestKey(pr));
+    const store = this.readSnoozeStore();
+    const entry = store[pullRequestKey(pr)];
+    if (!entry) {
+      return false;
+    }
+    return isSnoozedNow(entry, pr.updatedAt, new Date());
   }
 
-  private readSnoozed(): string[] {
-    return this.context.globalState.get<string[]>(SNOOZE_STATE_KEY, []);
+  private readSnoozeStore(): SnoozeStore {
+    const raw = this.context.globalState.get<unknown>(SNOOZE_STATE_KEY);
+    return migrateSnoozeState(raw);
   }
 
-  private async toggleSnooze(key: string): Promise<void> {
-    const current = this.readSnoozed();
-    const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
-    await this.context.globalState.update(SNOOZE_STATE_KEY, next);
+  /**
+   * Handles snooze/unsnooze for a card key.
+   *
+   * Un-snooze: one click, no picker.
+   * Snooze: shows a QuickPick with three time choices, then stores the selection.
+   */
+  private async handleSnooze(key: string): Promise<void> {
+    const store = this.readSnoozeStore();
+    const entry = store[key];
+
+    if (entry) {
+      // Already snoozed → unsnooze immediately (one click, no picker per spec)
+      const newStore = unsnooze(store, key);
+      await this.context.globalState.update(SNOOZE_STATE_KEY, newStore);
+      this.renderFromCache();
+      return;
+    }
+
+    // Not snoozed → show QuickPick
+    const CHOICES: { label: string; choice: SnoozeChoice }[] = [
+      { label: '1 hour', choice: '1hour' },
+      { label: 'Tomorrow 9am', choice: 'tomorrow9am' },
+      { label: 'Until the PR changes', choice: 'untilChanged' },
+    ];
+    const picked = await vscode.window.showQuickPick(
+      CHOICES.map((c) => c.label),
+      { title: 'Snooze until…', placeHolder: 'Choose how long to snooze this PR' },
+    );
+    if (!picked) {
+      return; // user cancelled the picker
+    }
+    const found = CHOICES.find((c) => c.label === picked);
+    if (!found) {
+      return; // should never happen: picked is always one of the CHOICES labels
+    }
+    const { choice } = found;
+    const pr = this.prsByKey.get(key);
+    const prUpdatedAt = pr?.updatedAt ?? '';
+    const newStore = snoozeUntil(store, key, choice, prUpdatedAt, new Date());
+    await this.context.globalState.update(SNOOZE_STATE_KEY, newStore);
+    this.renderFromCache();
   }
 
-  /** Test-only introspection seam — a webview button click can't be simulated in an integration test, so this drives the same toggle-then-render-from-cache flow the snooze button's message handler does. */
+  /** Test-only introspection seam — a webview button click can't be simulated in an integration test, so this drives the same toggle-then-render-from-cache flow the snooze button's message handler does. Snoozes as "until changed" when not snoozed; un-snoozes when already snoozed. */
   async toggleSnoozeForTest(key: string): Promise<void> {
-    await this.toggleSnooze(key);
+    const store = this.readSnoozeStore();
+    const entry = store[key];
+    let newStore: SnoozeStore;
+    if (entry) {
+      newStore = unsnooze(store, key);
+    } else {
+      const pr = this.prsByKey.get(key);
+      newStore = snoozeUntil(store, key, 'untilChanged', pr?.updatedAt ?? '', new Date());
+    }
+    await this.context.globalState.update(SNOOZE_STATE_KEY, newStore);
     this.renderFromCache();
   }
 
@@ -325,8 +414,7 @@ export class LaunchpadViewProvider implements vscode.Disposable {
       return;
     }
     if (type === 'toggleSnooze' && typeof key === 'string') {
-      await this.toggleSnooze(key);
-      this.renderFromCache();
+      await this.handleSnooze(key);
       return;
     }
     if (type === 'closePr' && typeof key === 'string') {

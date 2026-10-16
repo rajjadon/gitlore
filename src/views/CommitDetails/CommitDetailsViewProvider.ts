@@ -15,15 +15,8 @@ import { buildCommitSummaryPrompt } from '../../core/ai/prompts';
 import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
 import type { CommitDetail } from '../../core/git/types';
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
+import { createNonce } from '../nonce';
+import { showAiDisabledNotice } from '../../ai/showAiDisabledNotice';
 
 /** Docks commit details in the bottom panel (next to Commit Graph), instead of opening a new editor tab per commit. */
 export class CommitDetailsViewProvider implements vscode.WebviewViewProvider {
@@ -214,11 +207,7 @@ export class CommitDetailsViewProvider implements vscode.WebviewViewProvider {
       }
       switch (event.type) {
         case 'disabled':
-          void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-            if (choice) {
-              void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-            }
-          });
+          void showAiDisabledNotice();
           this.postAiMessage({ type: 'aiSummaryReset' });
           break;
         case 'cached':

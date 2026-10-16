@@ -85,7 +85,7 @@ export async function mergePullRequestFlow(ctx: ActionContext): Promise<boolean>
   }
 }
 
-export async function submitReviewFlow(ctx: ActionContext, decision: ReviewSubmission): Promise<boolean> {
+export async function submitReviewFlow(ctx: ActionContext, decision: ReviewSubmission, body?: string): Promise<boolean> {
   const { pr, client, ui, logError, myLogin } = ctx;
   // Every host rejects a self-review one way or another — catching it here produces one clear
   // message instead of a different opaque API rejection per host.
@@ -98,8 +98,10 @@ export async function submitReviewFlow(ctx: ActionContext, decision: ReviewSubmi
   if (confirmed !== verb) {
     return false;
   }
+  // Trim and coerce empty/whitespace-only body to undefined so clients skip the comment step.
+  const trimmedBody = body?.trim() || undefined;
   try {
-    await client.submitReview(pr.repo, pr.number, decision);
+    await client.submitReview(pr.repo, pr.number, decision, trimmedBody);
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

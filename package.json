@@ -50,6 +50,16 @@
         "icon": "$(git-pull-request)"
       },
       {
+        "command": "gitLore.openPullRequestForCommit",
+        "title": "GitLore: Open Pull Request for Commit",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "gitLore.findWhenTextChanged",
+        "title": "GitLore: Find When Text Was Added or Removed",
+        "icon": "$(search-view-icon)"
+      },
+      {
         "command": "gitLore.openGraph",
         "title": "GitLore: Open Commit Graph",
         "icon": "$(type-hierarchy)"
@@ -488,12 +498,20 @@
           "when": "false"
         },
         {
+          "command": "gitLore.openPullRequestForCommit",
+          "when": "false"
+        },
+        {
           "command": "gitLore.showCoChangedFiles",
           "when": "false"
         },
         {
           "command": "gitLore.askAboutLine",
           "when": "false"
+        },
+        {
+          "command": "gitLore.findWhenTextChanged",
+          "when": "workspaceContains:.git"
         }
       ]
     },
@@ -519,6 +537,11 @@
           "type": "boolean",
           "default": true,
           "description": "Pass -w to git blame to ignore whitespace-only changes."
+        },
+        "gitLore.blame.detectMoves": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pass -M -C to git blame to follow lines moved or copied between files. Produces more accurate blame for refactored code, but is slower on large files."
         },
         "gitLore.maxBlameFileSize": {
           "type": "number",
@@ -605,6 +628,11 @@
           "default": false,
           "description": "Enable Launchpad, the cross-repo PR triage board. Off by default — it's the only GitLore feature that calls out to a remote host (GitHub, GitLab, Bitbucket, Azure DevOps, or a configured custom instance) rather than working entirely from your local .git."
         },
+        "gitLore.launchpad.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a status-bar item with the number of pull requests that need your review. Only has an effect when gitLore.launchpad.enabled is also true — the status bar is never created and makes zero network calls when Launchpad is disabled."
+        },
         "gitLore.launchpad.customHosts": {
           "type": "array",
           "default": [],
@@ -647,6 +675,7 @@
     "watch": "node esbuild.js --watch",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "node scripts/run-unit-tests.mjs",
+    "test:coverage": "node scripts/run-coverage.mjs",
     "test:integration": "npm run compile && tsc -p . --outDir out-test && node out-test/test/integration/runTests.js",
     "lint": "eslint --no-error-on-unmatched-pattern src test && tsc --noEmit -p .",
     "icon": "rsvg-convert -w 256 -h 256 media/icon.svg -o media/icon.png",

@@ -19,18 +19,11 @@ import { LruCache } from '../../core/cache/LruCache';
 import type { LanguageModelClient } from '../../ai/LanguageModelClient';
 import { runCommitSummaryFlow } from '../../core/ai/commitSummaryFlow';
 import { buildBranchCompareSummaryPrompt } from '../../core/ai/prompts';
+import { createNonce } from '../nonce';
+import { showAiDisabledNotice } from '../../ai/showAiDisabledNotice';
 
 /** Above this, "Open all changes" confirms first — opening dozens of diff editors in one click is more likely a misclick than the intent. */
 const OPEN_ALL_CONFIRM_THRESHOLD = 20;
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
 
 /** Docks branch comparison in the bottom panel (next to Commit Graph/Commit Details), instead of opening a new editor tab per comparison. */
 export class BranchComparisonViewProvider implements vscode.WebviewViewProvider {
@@ -388,11 +381,7 @@ export class BranchComparisonViewProvider implements vscode.WebviewViewProvider 
       }
       switch (event.type) {
         case 'disabled':
-          void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-            if (choice) {
-              void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-            }
-          });
+          void showAiDisabledNotice();
           this.postAiMessage({ type: 'aiSummaryReset' });
           break;
         case 'cached':

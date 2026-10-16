@@ -31,7 +31,16 @@ export function handleStepLineHistoryCommand(git: GitService, navStore: LruCache
       if (typeof filePath !== 'string' || typeof line !== 'number' || (direction !== 'prev' && direction !== 'next')) {
         return;
       }
-      const history = await git.getLineHistory(filePath, line);
+      // Extend to the active selection's end line when the selection is multi-line and spans the
+      // target line — lets the hover stepper walk through range history, not just single-line history.
+      const activeEditor = vscode.window.activeTextEditor;
+      const sel = activeEditor?.selection;
+      const endLine =
+        sel && !sel.isEmpty && sel.start.line !== sel.end.line &&
+        sel.start.line <= line && sel.end.line >= line
+          ? sel.end.line
+          : undefined;
+      const history = await git.getLineHistory(filePath, line, endLine);
       if (history.length === 0) {
         return;
       }

@@ -1,6 +1,7 @@
 import type { FileChange } from '../git/types';
 import type { ForgeClient } from './ForgeClient';
 import type {
+  CheckDetail,
   CheckStatus,
   ConversationThread,
   CreatePullRequestOptions,
@@ -10,25 +11,31 @@ import type {
   PullRequestSummary,
   ReviewDecision,
   ReviewSubmission,
+  ThreadComment,
 } from './types';
 import { forgeFetch, ForgeHttpError, fetchAllPages, nextLinkFromHeader, mapWithConcurrency, sameLogin } from './forgeFetch';
 
-/** Fetches up to 100 review threads and each one's first comment — enough to identify and resolve a conversation without paginating replies nobody asked to see. */
+/**
+ * Fetches review threads with cursor-based pagination (100 per page) and all comments per thread.
+ * `$after` is `null` for the first page, the previous `endCursor` for subsequent ones.
+ */
 const REVIEW_THREADS_QUERY = `
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id
           isResolved
           path
           line
           originalLine
-          comments(first: 1) {
+          comments(first: 100) {
             nodes {
               body
               author { login }
+              createdAt
             }
           }
         }
@@ -44,10 +51,25 @@ mutation($threadId: ID!) {
   }
 }`;
 
+const ADD_PULL_REQUEST_REVIEW_THREAD_REPLY_MUTATION = `
+mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
+    comment { id }
+  }
+}`;
+
+const UNRESOLVE_REVIEW_THREAD_MUTATION = `
+mutation($threadId: ID!) {
+  unresolveReviewThread(input: { threadId: $threadId }) {
+    thread { id isResolved }
+  }
+}`;
+
 interface GitHubReviewThreadsResponse {
   repository: {
     pullRequest: {
       reviewThreads: {
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
         nodes: Array<{
           id: string;
           isResolved: boolean;
@@ -55,7 +77,7 @@ interface GitHubReviewThreadsResponse {
           /** Null once the thread's commit is no longer part of the PR (an outdated/superseded diff) — `originalLine` is always set for a line comment, so it's the fallback. */
           line: number | null;
           originalLine: number | null;
-          comments: { nodes: Array<{ body: string; author: { login: string } | null }> };
+          comments: { nodes: Array<{ body: string; author: { login: string } | null; createdAt: string }> };
         }>;
       };
     };
@@ -75,7 +97,7 @@ interface GitHubPull {
   created_at: string;
   updated_at: string;
   requested_reviewers?: GitHubUser[];
-  head: { sha: string };
+  head?: { sha: string };
 }
 
 /** Only present on `state=closed` results — `merged_at` is non-null exactly when the PR was merged rather than closed without merging. */
@@ -91,8 +113,10 @@ interface GitHubReview {
 }
 
 interface GitHubCheckRun {
+  name: string;
   status: 'queued' | 'in_progress' | 'completed';
   conclusion: 'success' | 'failure' | 'neutral' | 'cancelled' | 'timed_out' | 'action_required' | 'stale' | null;
+  html_url: string | null;
 }
 
 interface GitHubPullFile {
@@ -152,6 +176,12 @@ function computeReviewedByMe(reviews: GitHubReview[], myLogin: string | undefine
 }
 
 const FAILING_CONCLUSIONS = new Set(['failure', 'timed_out', 'cancelled', 'action_required']);
+
+function toCheckDetailStatus(run: GitHubCheckRun): CheckStatus {
+  if (run.status !== 'completed') return 'pending';
+  if (run.conclusion !== null && FAILING_CONCLUSIONS.has(run.conclusion)) return 'failing';
+  return 'passing';
+}
 
 function computeCheckStatus(checkRuns: GitHubCheckRun[]): CheckStatus {
   if (checkRuns.length === 0) {
@@ -240,6 +270,7 @@ export class GitHubClient implements ForgeClient {
       isDraft: pull.draft ?? false,
       createdAt: pull.created_at,
       updatedAt: pull.updated_at,
+      headSha: pull.head?.sha ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
@@ -265,14 +296,19 @@ export class GitHubClient implements ForgeClient {
     });
   }
 
-  /** GitHub's `application/vnd.github.v3.diff` media type returns the whole PR's unified diff as plain text directly — no reconstruction needed, unlike GitLab. */
+  /** GitHub's `application/vnd.github.v3.diff` media type returns the whole PR's unified diff as plain text directly — no reconstruction needed, unlike GitLab. Files are paginated via Link headers. */
   async getPullRequestDiff(repo: ForgeRepoRef, number: number): Promise<PullRequestDiff> {
-    const [diffRes, filesRes] = await Promise.all([
-      this.request(`/repos/${repo.identity}/pulls/${number}`, { headers: { Accept: 'application/vnd.github.v3.diff' } }),
-      this.request(`/repos/${repo.identity}/pulls/${number}/files?per_page=100`),
+    const [diff, rawFiles] = await Promise.all([
+      (async () => (await this.request(`/repos/${repo.identity}/pulls/${number}`, { headers: { Accept: 'application/vnd.github.v3.diff' } })).text())(),
+      fetchAllPages<GitHubPullFile>(
+        `/repos/${repo.identity}/pulls/${number}/files?per_page=100`,
+        async (url) => {
+          const res = await this.request(url);
+          const items = (await res.json()) as GitHubPullFile[];
+          return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+        },
+      ),
     ]);
-    const diff = await diffRes.text();
-    const rawFiles = (await filesRes.json()) as GitHubPullFile[];
     const files: FileChange[] = rawFiles.map((f) => ({
       path: f.filename,
       insertions: f.additions,
@@ -282,10 +318,14 @@ export class GitHubClient implements ForgeClient {
     return { files, diff };
   }
 
-  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission): Promise<void> {
+  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission, body?: string): Promise<void> {
+    const payload: Record<string, unknown> = { event: decision === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES' };
+    if (body && body.trim().length > 0) {
+      payload['body'] = body;
+    }
     await this.request(`/repos/${repo.identity}/pulls/${number}/reviews`, {
       method: 'POST',
-      body: JSON.stringify({ event: decision === 'approve' ? 'APPROVE' : 'REQUEST_CHANGES' }),
+      body: JSON.stringify(payload),
     });
   }
 
@@ -300,19 +340,42 @@ export class GitHubClient implements ForgeClient {
   /**
    * GitHub has no REST endpoint for review threads at all — only the GraphQL `reviewThreads`
    * connection (see `graphql()`, a second request path alongside the REST `request()` this class
-   * otherwise exclusively uses).
+   * otherwise exclusively uses). Paginated with cursor-based pagination; empty string is the
+   * "no cursor yet" sentinel for `fetchAllPages`, which passes `null` to the GraphQL variable.
    */
   async listConversationThreads(repo: ForgeRepoRef, number: number): Promise<ConversationThread[]> {
     const [owner, name] = repo.identity.split('/');
-    const data = await this.graphql<GitHubReviewThreadsResponse>(REVIEW_THREADS_QUERY, { owner, name, number });
-    return data.repository.pullRequest.reviewThreads.nodes.map((thread) => {
-      const comment = thread.comments.nodes[0];
+    // Empty string = "no cursor yet"; the callback converts '' → null for the GraphQL $after variable.
+    const nodes = await fetchAllPages(
+      '',
+      async (cursor) => {
+        const data = await this.graphql<GitHubReviewThreadsResponse>(REVIEW_THREADS_QUERY, {
+          owner,
+          name,
+          number,
+          after: cursor === '' ? null : cursor,
+        });
+        const rt = data.repository.pullRequest.reviewThreads;
+        return {
+          items: rt.nodes,
+          next: rt.pageInfo.hasNextPage ? (rt.pageInfo.endCursor ?? undefined) : undefined,
+        };
+      },
+    );
+    return nodes.map((thread) => {
+      const firstComment = thread.comments.nodes[0];
       const line = thread.line ?? thread.originalLine ?? undefined;
+      const comments: ThreadComment[] = thread.comments.nodes.map((c) => ({
+        authorLogin: c.author?.login ?? '',
+        body: c.body,
+        ...(c.createdAt ? { createdAt: c.createdAt } : {}),
+      }));
       return {
         id: thread.id,
-        body: comment?.body ?? '',
-        authorLogin: comment?.author?.login ?? '',
+        body: firstComment?.body ?? '',
+        authorLogin: firstComment?.author?.login ?? '',
         resolved: thread.isResolved,
+        comments,
         ...(thread.path !== undefined ? { file: thread.path } : {}),
         ...(line !== undefined ? { line } : {}),
       };
@@ -322,6 +385,36 @@ export class GitHubClient implements ForgeClient {
   /** `resolveReviewThread` — the GraphQL mutation counterpart to `reviewThreads`; same reasoning as `listConversationThreads` for why this isn't a REST call. */
   async resolveConversationThread(_repo: ForgeRepoRef, _number: number, threadId: string): Promise<void> {
     await this.graphql(RESOLVE_REVIEW_THREAD_MUTATION, { threadId });
+  }
+
+  /** `addPullRequestReviewThreadReply` — GraphQL mutation; only thread replies have a dedicated thread-scoped mutation, top-level comments use the REST issues endpoint via `addComment`. */
+  async replyToThread(_repo: ForgeRepoRef, _number: number, threadId: string, body: string): Promise<void> {
+    await this.graphql(ADD_PULL_REQUEST_REVIEW_THREAD_REPLY_MUTATION, { threadId, body });
+  }
+
+  /** `unresolveReviewThread` — GraphQL mutation counterpart to `resolveReviewThread`. */
+  async unresolveConversationThread(_repo: ForgeRepoRef, _number: number, threadId: string): Promise<void> {
+    await this.graphql(UNRESOLVE_REVIEW_THREAD_MUTATION, { threadId });
+  }
+
+  /** Lists all check-runs for the PR's head commit. The SHA comes from a single PR fetch so the caller doesn't need to supply it. */
+  async listChecks(repo: ForgeRepoRef, number: number): Promise<CheckDetail[]> {
+    const prRes = await this.request(`/repos/${repo.identity}/pulls/${number}`);
+    const pr = (await prRes.json()) as GitHubPull;
+    const sha = pr.head?.sha ?? '';
+    const runs = await fetchAllPages<GitHubCheckRun>(
+      `/repos/${repo.identity}/commits/${sha}/check-runs?per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const data = (await res.json()) as { check_runs: GitHubCheckRun[] };
+        return { items: data.check_runs ?? [], next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
+    return runs.map((run) => ({
+      name: run.name,
+      status: toCheckDetailStatus(run),
+      ...(run.html_url ? { url: run.html_url } : {}),
+    }));
   }
 
   /** `merge_method` maps directly to GitHub's own three strategies. Deleting the source branch is a separate call — GitHub's merge endpoint has no option for it — so it only fetches the head ref (one extra GET) when actually requested. */
@@ -357,12 +450,35 @@ export class GitHubClient implements ForgeClient {
       isDraft: data.draft ?? options.draft,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
+      headSha: data.head?.sha ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
       hasConflicts: false,
       reviewedByMe: false,
     };
+  }
+
+  /**
+   * One page only — a commit is in very few PRs. `merged_at !== null` identifies merged ones.
+   * 404 means the commit is unknown to GitHub (not pushed, or wrong repo) — treated as null.
+   */
+  async findPullRequestForCommit(repo: ForgeRepoRef, sha: string): Promise<{ number: number; title: string; url: string } | null> {
+    try {
+      const res = await this.request(`/repos/${repo.identity}/commits/${sha}/pulls?per_page=100`);
+      const prs = (await res.json()) as Array<{ number: number; title: string; html_url: string; merged_at: string | null }>;
+      // Prefer merged (merged_at non-null) over open or closed-without-merging.
+      const chosen = prs.find((pr) => pr.merged_at !== null) ?? prs[0];
+      if (!chosen) {
+        return null;
+      }
+      return { number: chosen.number, title: chosen.title, url: chosen.html_url };
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /** Best-effort: if this fails, the merge itself already succeeded, so the caller just keeps the source branch around rather than failing an otherwise-successful merge over branch cleanup. Returns both the ref name and the head repo's full_name so the caller can guard against cross-fork branch deletion (N3). */
@@ -418,6 +534,7 @@ export class GitHubClient implements ForgeClient {
       isDraft: pull.draft ?? false,
       createdAt: pull.created_at,
       updatedAt: pull.updated_at,
+      headSha: pull.head?.sha ?? '',
       requestedReviewers,
       checkStatus: 'none',
       reviewDecision: computeReviewDecision(reviews, requestedReviewers),
@@ -429,7 +546,7 @@ export class GitHubClient implements ForgeClient {
   private async enrich(repo: ForgeRepoRef, pull: GitHubPull): Promise<PullRequestSummary> {
     const [reviews, checkRuns, mergeableState] = await Promise.all([
       this.fetchReviews(repo, pull.number),
-      this.fetchCheckRuns(repo, pull.head.sha),
+      this.fetchCheckRuns(repo, pull.head?.sha ?? ''),
       this.fetchMergeableState(repo, pull.number),
     ]);
     const requestedReviewers = (pull.requested_reviewers ?? []).map((u) => u.login);
@@ -442,6 +559,7 @@ export class GitHubClient implements ForgeClient {
       isDraft: pull.draft ?? false,
       createdAt: pull.created_at,
       updatedAt: pull.updated_at,
+      headSha: pull.head?.sha ?? '',
       requestedReviewers,
       checkStatus: computeCheckStatus(checkRuns),
       reviewDecision: computeReviewDecision(reviews, requestedReviewers),

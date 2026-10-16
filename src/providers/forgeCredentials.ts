@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { AzureDevOpsCredentialScheme } from '../core/forge/AzureDevOpsClient';
 import type { DetectedForgeHost } from '../core/forge/hostDetection';
+import { usesBuiltInSessionForHost } from '../core/forge/silentCredentialPath';
 
 /**
  * Azure DevOps' well-known AAD resource ID — stable across every organization, not a GitLore- or
@@ -15,10 +16,7 @@ function secretKeyFor(displayHost: string): string {
 
 /** True for the two hosts VS Code ships a built-in authentication session for — github.com's GitHub session, and Azure DevOps Services' Microsoft/AAD session. Self-hosted instances of either (GHE, on-prem Azure DevOps Server via `customHosts`) still need a PAT: neither ships (or necessarily *can* ship) the same built-in session. */
 function usesBuiltInSession(detected: DetectedForgeHost): boolean {
-  return (
-    (detected.flavor === 'github' && detected.displayHost === 'github.com') ||
-    (detected.flavor === 'azureDevOps' && detected.displayHost === 'dev.azure.com')
-  );
+  return usesBuiltInSessionForHost(detected);
 }
 
 /**
@@ -83,6 +81,34 @@ export async function clearForgeToken(secrets: vscode.SecretStorage, detected: D
     return;
   }
   await secrets.delete(secretKeyFor(detected.displayHost));
+}
+
+/**
+ * Silent-only credential resolution used by LaunchpadStatusBar (Phase D). It NEVER calls
+ * `showInputBox` or `createIfNone: true` — the status bar updates in the background and must not
+ * prompt the user.
+ *
+ * - Built-in session hosts (github.com / dev.azure.com): `getSession(..., { createIfNone: false,
+ *   silent: true })` — returns an existing session or null; never pops an auth UI.
+ * - PAT hosts: `secrets.get(key)` only — returns the previously-stored token or null.
+ *
+ * Returns `null` for any host that hasn't been signed in yet; the status bar treats that repo as
+ * unreachable and hides its count rather than prompting.
+ */
+export async function resolveForgeTokenSilently(
+  secrets: vscode.SecretStorage,
+  detected: DetectedForgeHost,
+): Promise<string | null> {
+  if (detected.flavor === 'github' && detected.displayHost === 'github.com') {
+    const session = await vscode.authentication.getSession('github', ['repo'], { createIfNone: false, silent: true });
+    return session?.accessToken ?? null;
+  }
+  if (detected.flavor === 'azureDevOps' && detected.displayHost === 'dev.azure.com') {
+    const session = await vscode.authentication.getSession('microsoft', AZURE_DEVOPS_AAD_SCOPES, { createIfNone: false, silent: true });
+    return session?.accessToken ?? null;
+  }
+  // PAT host — secrets.get only, never showInputBox
+  return (await secrets.get(secretKeyFor(detected.displayHost))) ?? null;
 }
 
 /**

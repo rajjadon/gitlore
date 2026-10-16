@@ -28,6 +28,7 @@ function pr(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
     ...overrides,
   };
 }
@@ -278,4 +279,45 @@ test('submitReviewFlow: myLogin undefined → no self-review block (no login to 
   const result = await submitReviewFlow({ ...ctx({ pr: pr({ authorLogin: 'raj' }), myLogin: undefined }), ui, client }, 'approve');
   assert.equal(result, true);
   assert.equal(called, true);
+});
+
+// ─── submitReviewFlow body (B3.2) ────────────────────────────────────────────
+
+test('submitReviewFlow: non-empty body is forwarded to client.submitReview', async () => {
+  let receivedBody: string | undefined;
+  const ui = fakeUi({ confirmAnswer: 'Approve' });
+  const client: ForgeClient = {
+    ...fakeClient(),
+    async submitReview(_repo: unknown, _num: unknown, _decision: ReviewSubmission, body?: string) {
+      receivedBody = body;
+    },
+  } as unknown as ForgeClient;
+  await submitReviewFlow({ ...ctx({ pr: pr({ authorLogin: 'alice' }), myLogin: 'raj', client }), ui }, 'approve', 'LGTM');
+  assert.equal(receivedBody, 'LGTM');
+});
+
+test('submitReviewFlow: whitespace-only body is trimmed to undefined — no empty comment sent', async () => {
+  let receivedBody: string | undefined = 'sentinel';
+  const ui = fakeUi({ confirmAnswer: 'Approve' });
+  const client: ForgeClient = {
+    ...fakeClient(),
+    async submitReview(_repo: unknown, _num: unknown, _decision: ReviewSubmission, body?: string) {
+      receivedBody = body;
+    },
+  } as unknown as ForgeClient;
+  await submitReviewFlow({ ...ctx({ pr: pr({ authorLogin: 'alice' }), myLogin: 'raj', client }), ui }, 'approve', '   ');
+  assert.equal(receivedBody, undefined);
+});
+
+test('submitReviewFlow: undefined body passed through as undefined', async () => {
+  let receivedBody: string | undefined = 'sentinel';
+  const ui = fakeUi({ confirmAnswer: 'Approve' });
+  const client: ForgeClient = {
+    ...fakeClient(),
+    async submitReview(_repo: unknown, _num: unknown, _decision: ReviewSubmission, body?: string) {
+      receivedBody = body;
+    },
+  } as unknown as ForgeClient;
+  await submitReviewFlow({ ...ctx({ pr: pr({ authorLogin: 'alice' }), myLogin: 'raj', client }), ui }, 'approve', undefined);
+  assert.equal(receivedBody, undefined);
 });

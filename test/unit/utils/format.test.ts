@@ -267,3 +267,33 @@ test('formatLineHistoryHover: escapes markdown special characters from git-sourc
   assert.ok(!md.includes('[Evil](http://evil.com)'));
   assert.ok(!md.includes('**here**'));
 });
+
+// ─── F2.4: "Open PR" hover link gating tests ──────────────────────────────
+
+test('formatBlameHover: "Open PR" link is absent by default (launchpadEnabled not passed)', () => {
+  const md = formatBlameHover(entry, diffStat, 'tracked.txt', 'line three', undefined, now);
+  assert.ok(!md.includes('openPullRequestForCommit'), '"Open PR" must not appear when launchpad is off');
+});
+
+test('formatBlameHover: "Open PR" link is absent when launchpadEnabled is false', () => {
+  const md = formatBlameHover(entry, diffStat, 'tracked.txt', 'line three', undefined, now, null, false);
+  assert.ok(!md.includes('openPullRequestForCommit'), '"Open PR" must not appear when launchpadEnabled=false');
+});
+
+test('formatBlameHover: "Open PR" link is present when launchpadEnabled is true', () => {
+  const md = formatBlameHover(entry, diffStat, 'tracked.txt', 'line three', undefined, now, null, true);
+  assert.match(md, /\[\$\(git-pull-request\) Open PR\]\(command:gitLore\.openPullRequestForCommit\?/);
+});
+
+test('formatBlameHover: "Open PR" link carries the file path and sha as encoded JSON args', () => {
+  const md = formatBlameHover(entry, diffStat, 'tracked.txt', 'line three', undefined, now, null, true);
+  const match = /command:gitLore\.openPullRequestForCommit\?(\S+)\)/.exec(md);
+  assert.ok(match, 'expected an encoded command link');
+  const args = JSON.parse(decodeURIComponent(match[1] ?? '')) as unknown[];
+  assert.deepEqual(args, ['tracked.txt', entry.sha]);
+});
+
+test('formatBlameHover: "Open PR" link is absent for uncommitted lines even with launchpadEnabled=true', () => {
+  const md = formatBlameHover({ ...entry, isUncommitted: true }, null, 'tracked.txt', 'line three', undefined, now, null, true);
+  assert.ok(!md.includes('openPullRequestForCommit'), '"Open PR" must never appear on an uncommitted line');
+});

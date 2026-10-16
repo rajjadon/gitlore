@@ -448,3 +448,114 @@ suite('Blame hover card', () => {
     });
   });
 });
+
+// ─── gitLore.openPullRequestForCommit — network/prompt isolation ─────────────
+//
+// These tests prove the privacy contract: the command makes ZERO network calls
+// and ZERO credential-prompting UI calls under specified conditions.
+//
+// Technique: replace globalThis.fetch (which buildForgeClient uses as its
+// default fetchImpl — evaluated at call time, not at module load time) and
+// vscode.window.showInputBox with counting stubs, restored in finally blocks.
+// The fixture repo has no remotes, so even when launchpad is enabled the
+// command exits early at "no recognized remote" before any credential lookup.
+
+suite('gitLore.openPullRequestForCommit — network and prompt isolation', () => {
+  let manifest: FixtureManifest;
+
+  suiteSetup(async () => {
+    manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as FixtureManifest;
+  });
+
+  /** Temporarily sets gitLore.launchpad.enabled and restores it in a finally block. */
+  async function withLaunchpadConfig<T>(enabled: boolean, fn: () => Promise<T>): Promise<T> {
+    const config = vscode.workspace.getConfiguration('gitLore');
+    await config.update('launchpad.enabled', enabled, vscode.ConfigurationTarget.Global);
+    try {
+      return await fn();
+    } finally {
+      await config.update('launchpad.enabled', undefined, vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  test('launchpad disabled: zero fetch calls and zero showInputBox calls', async () => {
+    const commit = manifest.commits[0];
+    assert.ok(commit, 'fixture must have at least one commit');
+
+    let fetchCallCount = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = ((..._args: Parameters<typeof fetch>) => {
+      fetchCallCount++;
+      return Promise.reject(new Error('fetch must not be called when launchpad is disabled'));
+    }) as typeof fetch;
+
+    let showInputBoxCallCount = 0;
+    const originalShowInputBox = vscode.window.showInputBox;
+    (vscode.window as { showInputBox: typeof vscode.window.showInputBox }).showInputBox = (
+      (..._args: Parameters<typeof vscode.window.showInputBox>) => {
+        showInputBoxCallCount++;
+        return Promise.resolve(undefined);
+      }
+    ) as typeof vscode.window.showInputBox;
+
+    try {
+      await withLaunchpadConfig(false, () =>
+        Promise.resolve(
+          vscode.commands.executeCommand(COMMANDS.openPullRequestForCommit, manifest.trackedFile, commit.sha),
+        ),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      vscode.window.showInputBox = originalShowInputBox;
+    }
+
+    assert.equal(fetchCallCount, 0, 'fetch must not be called when gitLore.launchpad.enabled is false');
+    assert.equal(showInputBoxCallCount, 0, 'showInputBox must not be called when gitLore.launchpad.enabled is false');
+  });
+
+  // Positive control: launchpad enabled, but the fixture repo has no remotes,
+  // so the command exits at "no recognized remote" before any credential or
+  // network call. This is deterministic — the fixture always has no remotes.
+  test('launchpad enabled, no remote: zero fetch calls and zero showInputBox calls (silent path)', async () => {
+    const commit = manifest.commits[0];
+    assert.ok(commit, 'fixture must have at least one commit');
+
+    let fetchCallCount = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = ((..._args: Parameters<typeof fetch>) => {
+      fetchCallCount++;
+      return Promise.reject(new Error('fetch must not be called when there is no recognized remote'));
+    }) as typeof fetch;
+
+    let showInputBoxCallCount = 0;
+    const originalShowInputBox = vscode.window.showInputBox;
+    (vscode.window as { showInputBox: typeof vscode.window.showInputBox }).showInputBox = (
+      (..._args: Parameters<typeof vscode.window.showInputBox>) => {
+        showInputBoxCallCount++;
+        return Promise.resolve(undefined);
+      }
+    ) as typeof vscode.window.showInputBox;
+
+    // Suppress the expected "No pull request host found" info message so it
+    // does not appear as a pop-up in the test host.
+    const originalShowInfo = vscode.window.showInformationMessage;
+    (vscode.window as { showInformationMessage: typeof vscode.window.showInformationMessage }).showInformationMessage = (
+      (_message: string, ..._rest: unknown[]) => Promise.resolve(undefined)
+    ) as typeof vscode.window.showInformationMessage;
+
+    try {
+      await withLaunchpadConfig(true, () =>
+        Promise.resolve(
+          vscode.commands.executeCommand(COMMANDS.openPullRequestForCommit, manifest.trackedFile, commit.sha),
+        ),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      vscode.window.showInputBox = originalShowInputBox;
+      vscode.window.showInformationMessage = originalShowInfo;
+    }
+
+    assert.equal(fetchCallCount, 0, 'fetch must not be called when repo has no recognized remote');
+    assert.equal(showInputBoxCallCount, 0, 'showInputBox must not be called on the silent credential path');
+  });
+});

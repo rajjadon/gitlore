@@ -9,20 +9,12 @@ import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
 import type { BlameSource } from '../../providers/BlameSource';
 import { GitCommandError } from '../../core/git/errors';
 import type { GraphCommit } from '../../core/git/types';
+import { createNonce } from '../nonce';
 
 const DEFAULT_MAX_GRAPH_ITEMS = 200;
 
 function errorMessage(err: unknown): string {
   return err instanceof GitCommandError ? err.stderr : err instanceof Error ? err.message : String(err);
-}
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
 }
 
 /**

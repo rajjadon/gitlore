@@ -457,8 +457,8 @@ test('listConversationThreads: only resolvable discussions are returned — a pl
   );
   const result = await client.listConversationThreads(REPO, 27);
   assert.deepEqual(result, [
-    { id: 'd1', body: 'Fix this', authorLogin: 'amy', resolved: false },
-    { id: 'd2', body: 'Already fine', authorLogin: 'raj', resolved: true },
+    { id: 'd1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] },
+    { id: 'd2', body: 'Already fine', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Already fine' }] },
   ]);
 });
 
@@ -484,7 +484,7 @@ test('listConversationThreads: surfaces the file/line a diff note is anchored to
     }),
   );
   const result = await client.listConversationThreads(REPO, 27);
-  assert.deepEqual(result, [{ id: 'd1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42 }]);
+  assert.deepEqual(result, [{ id: 'd1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }]);
 });
 
 test('resolveConversationThread: PUTs resolved=true to the discussion endpoint', async () => {
@@ -648,4 +648,311 @@ test('A4: enrich fan-out is bounded — concurrent approvals calls stay within l
   await client.listOpenPullRequests(REPO);
   assert.ok(maxConcurrentApprovals <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentApprovals}`);
   assert.ok(maxConcurrentApprovals > 1, 'must use some concurrency (not fully serial)');
+});
+
+// ── B1.1: headSha in PullRequestSummary ───────────────────────────────────
+
+test('B1.1: enrich populates headSha from mr.sha', async () => {
+  const client = new GitLabClient(BASE, 'tok', fakeFetch({
+    '/projects/acme%2Fwidgets/merge_requests/7': {
+      iid: 7, title: 'MR', web_url: 'u', author: { username: 'raj' },
+      created_at: 'c', updated_at: 'u', sha: 'abc123',
+    },
+    '/merge_requests/7/approvals': { approved: false, approved_by: [] },
+  }));
+  const result = await client.getPullRequest(REPO, 7);
+  assert.equal(result.headSha, 'abc123');
+});
+
+test('B1.1: fetchClosedList populates headSha', async () => {
+  const client = new GitLabClient(BASE, 'tok', fakeFetch({
+    '/user': { username: 'raj' },
+    '/merge_requests?state=merged&author_username=raj&order_by=updated_at&per_page=10': [
+      { iid: 10, title: 'Merged', web_url: 'u', author: { username: 'raj' }, created_at: 'c', updated_at: 'u', sha: 'cafebabe' },
+    ],
+    '/merge_requests?state=closed&author_username=raj&order_by=updated_at&per_page=10': [],
+  }));
+  await client.getAuthenticatedLogin();
+  const result = await client.listRecentlyClosedPullRequests(REPO);
+  assert.equal(result[0]?.headSha, 'cafebabe');
+});
+
+// ── B1.2: pagination — /diffs and /discussions ────────────────────────────
+
+test('B1.2: getPullRequestDiff paginates /diffs via Link header and returns all files', async () => {
+  const page2Url = `${BASE}/projects/acme%2Fwidgets/merge_requests/23/diffs?per_page=100&page=2`;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/merge_requests/23/diffs?per_page=100')) {
+      return new Response(
+        JSON.stringify([{ old_path: 'a.ts', new_path: 'a.ts', diff: '@@ -1 +1 @@\n+x' }]),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${page2Url}>; rel="next"` } },
+      );
+    }
+    if (url === page2Url) {
+      return jsonResponse([{ old_path: 'b.ts', new_path: 'b.ts', diff: '@@ -1 +1 @@\n+y' }]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 23);
+  assert.equal(result.files.length, 2, 'must return files from both pages');
+  assert.equal(result.files[0]?.path, 'a.ts');
+  assert.equal(result.files[1]?.path, 'b.ts');
+});
+
+test('B1.2: listConversationThreads paginates /discussions via Link header (2 pages)', async () => {
+  const page2Url = `${BASE}/projects/acme%2Fwidgets/merge_requests/27/discussions?per_page=100&page=2`;
+  let callCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    callCount++;
+    if (url.endsWith('/discussions?per_page=100')) {
+      return new Response(
+        JSON.stringify([{ id: 'd1', notes: [{ id: 1, body: 'Pg1', author: { username: 'amy' }, resolvable: true, resolved: false }] }]),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${page2Url}>; rel="next"` } },
+      );
+    }
+    if (url === page2Url) {
+      return jsonResponse([{ id: 'd2', notes: [{ id: 2, body: 'Pg2', author: { username: 'raj' }, resolvable: true, resolved: true }] }]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 27);
+  assert.equal(callCount, 2);
+  assert.equal(result.length, 2);
+  assert.equal(result[0]?.id, 'd1');
+  assert.equal(result[1]?.id, 'd2');
+});
+
+// B1.2 boundary: GitLab /diffs — 100 items (single page), 101 items (two pages), cap
+
+test('B1.2: getPullRequestDiff /diffs — exactly 100 items single page, no second request', async () => {
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/diffs')) {
+      reqCount++;
+      return jsonResponse(Array.from({ length: 100 }, (_, i) => ({ old_path: `f${i}.ts`, new_path: `f${i}.ts`, diff: '@@' })));
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 23);
+  assert.equal(reqCount, 1, 'single /diffs request for 100 items');
+  assert.equal(result.files.length, 100);
+});
+
+test('B1.2: getPullRequestDiff /diffs — 101 items across 2 pages, all returned', async () => {
+  const page2Url = `${BASE}/projects/acme%2Fwidgets/merge_requests/23/diffs?per_page=100&page=2`;
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/diffs?per_page=100')) {
+      reqCount++;
+      return new Response(
+        JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ old_path: `f${i}.ts`, new_path: `f${i}.ts`, diff: '@@' }))),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${page2Url}>; rel="next"` } },
+      );
+    }
+    if (url === page2Url) {
+      reqCount++;
+      return jsonResponse([{ old_path: 'extra.ts', new_path: 'extra.ts', diff: '@@' }]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 23);
+  assert.equal(reqCount, 2, '2 /diffs requests for 101 items');
+  assert.equal(result.files.length, 101);
+});
+
+test('B1.2: getPullRequestDiff /diffs — always-next source stops at MAX_PAGES (10)', async () => {
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/diffs')) {
+      reqCount++;
+      const nextUrl = `${BASE}/projects/acme%2Fwidgets/merge_requests/23/diffs?per_page=100&page=${reqCount + 1}`;
+      return new Response(
+        JSON.stringify([{ old_path: `f${reqCount}.ts`, new_path: `f${reqCount}.ts`, diff: '@@' }]),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${nextUrl}>; rel="next"` } },
+      );
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 23);
+  assert.equal(reqCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.files.length, 10);
+});
+
+// B1.2 boundary: GitLab /discussions — 100 items (single page), 101 items (two pages), cap
+
+function makeDiscussion(id: string) {
+  return { id, notes: [{ id: 1, body: 'text', author: { username: 'u' }, resolvable: true, resolved: false }] };
+}
+
+test('B1.2: listConversationThreads /discussions — exactly 100 items single page, no second request', async () => {
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/discussions')) {
+      reqCount++;
+      return jsonResponse(Array.from({ length: 100 }, (_, i) => makeDiscussion(`d${i}`)));
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 27);
+  assert.equal(reqCount, 1, 'single /discussions request for 100 items');
+  assert.equal(result.length, 100);
+});
+
+test('B1.2: listConversationThreads /discussions — 101 items across 2 pages, all returned', async () => {
+  const page2Url = `${BASE}/projects/acme%2Fwidgets/merge_requests/27/discussions?per_page=100&page=2`;
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/discussions?per_page=100')) {
+      reqCount++;
+      return new Response(
+        JSON.stringify(Array.from({ length: 100 }, (_, i) => makeDiscussion(`d${i}`))),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${page2Url}>; rel="next"` } },
+      );
+    }
+    if (url === page2Url) {
+      reqCount++;
+      return jsonResponse([makeDiscussion('d100')]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 27);
+  assert.equal(reqCount, 2, '2 /discussions requests for 101 items');
+  assert.equal(result.length, 101);
+});
+
+test('B1.2: listConversationThreads /discussions — always-next source stops at MAX_PAGES (10)', async () => {
+  let reqCount = 0;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/discussions')) {
+      reqCount++;
+      const nextUrl = `${BASE}/projects/acme%2Fwidgets/merge_requests/27/discussions?per_page=100&page=${reqCount + 1}`;
+      return new Response(
+        JSON.stringify([makeDiscussion(`d${reqCount}`)]),
+        { status: 200, headers: { 'Content-Type': 'application/json', 'Link': `<${nextUrl}>; rel="next"` } },
+      );
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 27);
+  assert.equal(reqCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.length, 10);
+});
+
+// ── B2.1: ConversationThread.comments array ────────────────────────────────
+
+test('B2.1: listConversationThreads maps all notes to ThreadComment[] with createdAt when present', async () => {
+  const client = new GitLabClient(BASE, 'tok', fakeFetch({
+    '/merge_requests/27/discussions?per_page=100': [
+      {
+        id: 'd1',
+        notes: [
+          { id: 1, body: 'Start', author: { username: 'amy' }, resolvable: true, resolved: false, created_at: '2024-01-01T00:00:00Z' },
+          { id: 2, body: 'Reply', author: { username: 'raj' }, resolvable: true, resolved: false, created_at: '2024-01-02T00:00:00Z' },
+        ],
+      },
+    ],
+  }));
+  const result = await client.listConversationThreads(REPO, 27);
+  assert.equal(result[0]?.comments.length, 2);
+  assert.deepEqual(result[0]?.comments[0], { authorLogin: 'amy', body: 'Start', createdAt: '2024-01-01T00:00:00Z' });
+  assert.deepEqual(result[0]?.comments[1], { authorLogin: 'raj', body: 'Reply', createdAt: '2024-01-02T00:00:00Z' });
+});
+
+// ── B2.2: replyToThread + unresolveConversationThread ─────────────────────
+
+test('B2.2: replyToThread POSTs body to the discussion notes endpoint', async () => {
+  let capturedUrl: string | undefined;
+  let capturedInit: RequestInit | undefined;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.replyToThread(REPO, 27, 'd1', 'LGTM!');
+  assert.equal(capturedUrl, 'https://gitlab.com/api/v4/projects/acme%2Fwidgets/merge_requests/27/discussions/d1/notes');
+  assert.equal(capturedInit?.method, 'POST');
+  assert.equal(capturedInit?.body, JSON.stringify({ body: 'LGTM!' }));
+});
+
+test('B2.2: unresolveConversationThread PUTs resolved=false', async () => {
+  let capturedUrl: string | undefined;
+  let capturedInit: RequestInit | undefined;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.unresolveConversationThread(REPO, 27, 'd1');
+  assert.equal(capturedUrl, 'https://gitlab.com/api/v4/projects/acme%2Fwidgets/merge_requests/27/discussions/d1?resolved=false');
+  assert.equal(capturedInit?.method, 'PUT');
+});
+
+// ── B3.1: submitReview with optional body ─────────────────────────────────
+
+test('B3.1: submitReview with body posts note first, then calls approve (2 requests, note URL first)', async () => {
+  const calls: string[] = [];
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.submitReview(REPO, 24, 'approve', 'Looks good!');
+  assert.equal(calls.length, 2, 'should make 2 requests: note then approve');
+  assert.ok(calls[0]?.includes('/notes'), 'first call must be the note endpoint');
+  assert.ok(calls[1]?.includes('/approve'), 'second call must be the approve endpoint');
+});
+
+test('B3.1: submitReview note failure blocks the vote — approve is never called', async () => {
+  let approveAttempted = false;
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/notes')) {
+      return new Response('Server Error', { status: 500, statusText: 'Internal Server Error' });
+    }
+    approveAttempted = true;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await assert.rejects(() => client.submitReview(REPO, 24, 'approve', 'Note text'));
+  assert.equal(approveAttempted, false, 'approve must not be called when the note fails');
+});
+
+test('B3.1: submitReview with whitespace-only body skips note and calls approve directly', async () => {
+  const calls: string[] = [];
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.submitReview(REPO, 24, 'approve', '   ');
+  assert.equal(calls.length, 1, 'whitespace body = skip note, just call approve');
+  assert.ok(calls[0]?.includes('/approve'));
+});
+
+// ── B4.1: listChecks ──────────────────────────────────────────────────────
+
+test('B4.1: listChecks fetches MR for pipeline id then job statuses, returning CheckDetail[]', async () => {
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/merge_requests/200')) {
+      return jsonResponse({ iid: 200, head_pipeline: { id: 42, status: 'running' } });
+    }
+    if (url.includes('/pipelines/42/jobs')) {
+      return jsonResponse([
+        { name: 'build', status: 'success', web_url: 'https://ci.example.com/1' },
+        { name: 'test', status: 'failed', web_url: 'https://ci.example.com/2' },
+        { name: 'lint', status: 'running' },
+      ]);
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 200);
+  assert.equal(result.length, 3);
+  assert.deepEqual(result[0], { name: 'build', status: 'passing', url: 'https://ci.example.com/1' });
+  assert.deepEqual(result[1], { name: 'test', status: 'failing', url: 'https://ci.example.com/2' });
+  assert.deepEqual(result[2], { name: 'lint', status: 'pending' });
+});
+
+test('B4.1: listChecks returns empty array when no pipeline is associated', async () => {
+  const client = new GitLabClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/merge_requests/201')) return jsonResponse({ iid: 201, head_pipeline: null });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 201);
+  assert.deepEqual(result, []);
 });

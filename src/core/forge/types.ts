@@ -6,6 +6,12 @@ export type ForgeHost = 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps';
 /** Combined CI/check-run status for a PR's head commit, collapsed to one value the board can bucket on. */
 export type CheckStatus = 'passing' | 'failing' | 'pending' | 'none';
 
+/** One named check with its status and an optional link to its log — the detail view shows these while the board only ever sees the rolled-up `CheckStatus`. */
+export interface CheckDetail { name: string; status: CheckStatus; url?: string }
+
+/** One comment within a `ConversationThread` — `ThreadComment[]` gives the full conversation history the panel can render, oldest first. */
+export interface ThreadComment { authorLogin: string; body: string; createdAt?: string }
+
 /** The PR-level review aggregate — GitHub calls this `review_decision`; GitLab/Bitbucket/Azure DevOps each have their own shape, normalized to this by their own client. */
 export type ReviewDecision = 'approved' | 'changesRequested' | 'reviewRequired' | 'none';
 
@@ -76,6 +82,12 @@ export interface PullRequestSummary {
   isDraft: boolean;
   createdAt: string;
   updatedAt: string;
+  /**
+   * The PR's head commit SHA at the time this summary was fetched — used to key the diff/AI-summary
+   * cache so a force-push invalidates the stale result. `''` when the host doesn't expose the head
+   * SHA on the given endpoint (e.g. the closed-PR list or `createPullRequest` for some hosts).
+   */
+  headSha: string;
   /** Logins still owed a review — removed once they've submitted one, so this never includes someone who's already reviewed. */
   requestedReviewers: string[];
   checkStatus: CheckStatus;
@@ -112,17 +124,21 @@ export interface PullRequestDiff {
  * One review conversation on a PR — GitHub's "review thread", GitLab's "discussion", Bitbucket's
  * top-level comment (its resolution model has no separate thread object), Azure DevOps' "comment
  * thread", all normalized to this shape. `id` is opaque and host-specific, only ever round-tripped
- * back to `resolveConversationThread` on the same host's client. `body` is the thread's first/only
- * comment — enough to identify which conversation this is without fetching every reply.
+ * back to `resolveConversationThread`/`replyToThread`/`unresolveConversationThread` on the same
+ * host's client. `body`/`authorLogin` always mirror `comments[0]` for backward compat.
  */
 export interface ConversationThread {
   id: string;
+  /** Mirrors `comments[0].body` — kept for backward compat with code that reads the top-level field. */
   body: string;
+  /** Mirrors `comments[0].authorLogin` — kept for backward compat. */
   authorLogin: string;
   resolved: boolean;
   /** The file/line this conversation is anchored to, when it's a code comment rather than a general PR-level one — every host we support already returns this alongside the thread data `listConversationThreads` fetches, it just wasn't being read. `line` is absent for a thread that isn't attached to any specific line. */
   file?: string;
   line?: number;
+  /** All comments in this thread, oldest first. `comments[0]` mirrors `body`/`authorLogin`. Populated by `listConversationThreads` on all four hosts. */
+  comments: ThreadComment[];
 }
 
 export const LAUNCHPAD_BUCKETS = [
@@ -142,6 +158,8 @@ export type LaunchpadBucket = (typeof LAUNCHPAD_BUCKETS)[number];
 export interface CategorizedPullRequest {
   pr: PullRequestSummary;
   bucket: LaunchpadBucket;
+  /** True when this PR comes from cached data because the repo's latest refresh failed — the board still shows it with a visual staleness marker. */
+  stale?: boolean;
 }
 
 /** Stable, globally-unique identity for a PR across hosts and repos — a PR `number` alone repeats constantly (every repo has a #1). Used both to key the snooze store and as the webview's per-card key. */

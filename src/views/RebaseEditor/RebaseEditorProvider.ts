@@ -4,15 +4,7 @@ import { dirname, join } from 'node:path';
 import { parseRebaseTodo, serializeRebaseTodo, type RebaseEntry } from '../../core/git/rebaseTodo';
 import { renderRebaseEditorHtml } from './render';
 import { CONFIG, MEDIA } from '../../constants';
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
+import { createNonce } from '../nonce';
 
 /** `<repoRoot>/.git/{rebase-merge,rebase-apply}/git-rebase-todo` — three directories up from the file is the repo root. */
 function repoRootForTodoFile(todoPath: string): string {
@@ -94,13 +86,15 @@ export class RebaseEditorProvider implements vscode.CustomTextEditorProvider {
       // then just point at Source Control rather than building a conflict-resolution UI of our own.
       setTimeout(() => {
         if (rebaseStillInProgress(repoRoot)) {
-          void vscode.window
-            .showInformationMessage('GitLore: the rebase paused, likely on a conflict. Resolve it in Source Control.', 'Open Source Control')
-            .then((choice) => {
-              if (choice) {
-                void vscode.commands.executeCommand('workbench.view.scm');
-              }
-            });
+          void (async () => {
+            const choice = await vscode.window.showInformationMessage(
+              'GitLore: the rebase paused, likely on a conflict. Resolve it in Source Control.',
+              'Open Source Control',
+            );
+            if (choice) {
+              void vscode.commands.executeCommand('workbench.view.scm');
+            }
+          })();
         }
       }, 1500);
     };

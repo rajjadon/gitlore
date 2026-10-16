@@ -51,6 +51,56 @@ import { buildDefaultUrlTemplate } from '../../utils/issueLinks';
 
 export interface BlameOptions {
   ignoreWhitespace?: boolean;
+  /** When true, adds `-M -C` so git follows lines moved or copied between files. Slower on large files. */
+  detectMoves?: boolean;
+}
+
+/**
+ * Pure function — builds the `git blame` argument array from options.
+ * Extracted so unit tests can verify every flag combination without spawning git.
+ */
+export function buildBlameArgs(opts: {
+  ignoreWhitespace?: boolean;
+  detectMoves?: boolean;
+  ignoreRevsFile?: string;
+  rel: string;
+}): string[] {
+  const args = ['blame', '--line-porcelain'];
+  if (opts.ignoreWhitespace) args.push('-w');
+  if (opts.detectMoves) args.push('-M', '-C');
+  if (opts.ignoreRevsFile) args.push('--ignore-revs-file', opts.ignoreRevsFile);
+  args.push('--', opts.rel);
+  return args;
+}
+
+/**
+ * Pure function — builds the `git log -S` / `-G` argument array for history search.
+ * Extracted for unit testing without spawning git.
+ */
+export function buildSearchHistoryArgs(opts: {
+  query: string;
+  mode: 'string' | 'regex';
+  maxCount: number;
+  rel?: string;
+}): string[] {
+  const flag = opts.mode === 'string' ? `-S${opts.query}` : `-G${opts.query}`;
+  const args = ['log', flag, '-n', String(opts.maxCount), `--pretty=tformat:${LOG_FORMAT}`];
+  if (opts.rel) args.push('--', opts.rel);
+  return args;
+}
+
+/**
+ * Pure function — builds the `git log -L` argument array for line-range history.
+ * Both `startLine` and `endLine` are 0-based (matching `BlameLine.line`); converted to git's
+ * 1-based internally. Reversed or negative ranges are normalised: `(9, 4)` → same as `(4, 9)`,
+ * negative values are clamped to 0.
+ */
+export function buildLineHistoryArgs(rel: string, startLine: number, endLine?: number): string[] {
+  const clampedStart = Math.max(0, startLine);
+  const clampedEnd = endLine !== undefined ? Math.max(0, endLine) : clampedStart;
+  const lo = Math.min(clampedStart, clampedEnd);
+  const hi = Math.max(clampedStart, clampedEnd);
+  return ['log', `--format=${LINE_HISTORY_FORMAT}`, '-L', `${lo + 1},${hi + 1}:${rel}`];
 }
 
 /**
@@ -121,17 +171,15 @@ export class GitService {
 
     const git = this.gitFor(repoRoot);
     const rel = toRepoRelativePath(repoRoot, this.toCanonicalPath(filePath));
-    const args = ['blame', '--line-porcelain'];
-    if (opts.ignoreWhitespace) {
-      args.push('-w');
-    }
     // git's own convention (supported since 2.23) for skipping mass-reformat/lint commits in
     // blame — auto-detected by filename, no setting needed, opt-in by simply having the file.
-    const ignoreRevsFile = join(repoRoot, '.git-blame-ignore-revs');
-    if (existsSync(ignoreRevsFile)) {
-      args.push('--ignore-revs-file', ignoreRevsFile);
-    }
-    args.push('--', rel);
+    const ignoreRevsFilePath = join(repoRoot, '.git-blame-ignore-revs');
+    const args = buildBlameArgs({
+      ignoreWhitespace: opts.ignoreWhitespace,
+      detectMoves: opts.detectMoves,
+      ignoreRevsFile: existsSync(ignoreRevsFilePath) ? ignoreRevsFilePath : undefined,
+      rel,
+    });
 
     try {
       const raw = await git.raw(args);
@@ -192,28 +240,60 @@ export class GitService {
   }
 
   /**
-   * Every commit that changed this exact line, newest first, via git's own line-tracking (`-L`)
-   * rather than a naive "which commits touched this file" scan — the blame hover's prev/next
-   * stepper walks this list. `line` is 0-based (matching `BlameLine.line`); git's `-L` is 1-based.
+   * Every commit that changed this line (or line range), newest first, via git's own line-tracking
+   * (`-L`) rather than a naive "which commits touched this file" scan — the blame hover's prev/next
+   * stepper walks this list. `line` and `endLine` are 0-based (matching `BlameLine.line`); git's
+   * `-L` is 1-based. When `endLine` is provided the history covers all commits that touched any
+   * line in the range; a reversed or negative range is clamped automatically by `buildLineHistoryArgs`.
    *
    * Doesn't pass `--follow`: combining it with `-L` has been unreliable across git versions, and
    * stepping through one file's own history is enough for this feature.
    */
-  async getLineHistory(filePath: string, line: number): Promise<Commit[]> {
+  async getLineHistory(filePath: string, line: number, endLine?: number): Promise<Commit[]> {
     const repoRoot = await this.getRepoRoot(filePath);
     if (!repoRoot) {
       return [];
     }
     const git = this.gitFor(repoRoot);
     const rel = toRepoRelativePath(repoRoot, this.toCanonicalPath(filePath));
-    const gitLine = line + 1;
-    const args = ['log', `--format=${LINE_HISTORY_FORMAT}`, '-L', `${gitLine},${gitLine}:${rel}`];
+    const args = buildLineHistoryArgs(rel, line, endLine);
     try {
       const raw = await git.raw(args);
       return parseLineHistoryLog(raw);
     } catch {
       // Line out of range, file deleted, or an unborn HEAD — nothing to step through, not an error.
       return [];
+    }
+  }
+
+  /**
+   * Commits across the repo (or scoped to one file) that added or removed a specific string or
+   * regex pattern, newest first. Uses `git log -S` (string presence) or `-G` (regex match in diff).
+   * An invalid regex throws a `GitCommandError` before spawning git — the caller should surface
+   * the message. An empty query returns an empty array silently (guards at the command layer should
+   * already prevent this, but belt-and-suspenders here).
+   */
+  async searchHistory(repoRoot: string, query: string, mode: 'string' | 'regex', maxCount: number, filePath?: string): Promise<Commit[]> {
+    if (!query.trim()) {
+      return [];
+    }
+    if (mode === 'regex') {
+      try {
+        new RegExp(query);
+      } catch (err) {
+        throw new GitCommandError(`git log -G${query}`, `Invalid regular expression: ${String(err)}`);
+      }
+    }
+    const git = this.gitFor(repoRoot);
+    const rel = filePath ? toRepoRelativePath(repoRoot, this.toCanonicalPath(filePath)) : undefined;
+    const args = buildSearchHistoryArgs({ query, mode, maxCount, rel });
+    try {
+      const raw = await git.raw(args);
+      return parseLog(raw);
+    } catch (err) {
+      const stderr = err instanceof Error ? err.message : String(err);
+      this.logger?.error(`git log -S/-G search failed in ${repoRoot}`, err);
+      throw new GitCommandError(args.join(' '), stderr);
     }
   }
 

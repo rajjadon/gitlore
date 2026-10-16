@@ -23,6 +23,7 @@ function pr(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
     ...overrides,
   };
 }
@@ -292,4 +293,43 @@ test('renderLaunchpadHtml: repo Fetch button posts a keyed fetch message', () =>
     opts,
   );
   assert.match(html, /querySelectorAll\('\.repo-fetch'\)[\s\S]*?vscode\.postMessage\(\{ type: 'fetch', key: btn\.dataset\.key \}\);/);
+});
+
+// C3.1: "Updated N ago" in board header
+test('renderLaunchpadHtml: shows "Updated just now" when lastLoadedAt is very recent', () => {
+  const lastLoadedAt = new Date(now.getTime() - 5_000); // 5 s ago
+  const html = renderLaunchpadHtml({ categorized: [{ pr: pr(), bucket: 'waiting' }], errors: [], now, lastLoadedAt }, opts);
+  assert.match(html, /Updated just now/);
+});
+
+test('renderLaunchpadHtml: shows "Updated N min ago" when lastLoadedAt is minutes ago', () => {
+  const lastLoadedAt = new Date(now.getTime() - 5 * 60_000); // 5 min ago
+  const html = renderLaunchpadHtml({ categorized: [{ pr: pr(), bucket: 'waiting' }], errors: [], now, lastLoadedAt }, opts);
+  assert.match(html, /Updated 5 min ago/);
+});
+
+test('renderLaunchpadHtml: no lastLoadedAt provided — no "Updated" text', () => {
+  const html = renderLaunchpadHtml({ categorized: [{ pr: pr(), bucket: 'waiting' }], errors: [], now }, opts);
+  assert.ok(!html.includes('Updated '));
+});
+
+// C3.2: stale marker on cards
+test('renderLaunchpadHtml: a stale PR card shows a stale marker text', () => {
+  const categorized = [{ pr: pr(), bucket: 'waiting' as const, stale: true }];
+  const html = renderLaunchpadHtml({ categorized, errors: [], now }, opts);
+  assert.match(html, /stale/i);
+});
+
+test('renderLaunchpadHtml: a non-stale PR card has no stale marker', () => {
+  const categorized = [{ pr: pr(), bucket: 'waiting' as const }];
+  const html = renderLaunchpadHtml({ categorized, errors: [], now }, opts);
+  // Check for the stale icon/class specifically (not any occurrence of the word "stale")
+  assert.ok(!html.includes('class="stale-marker"'));
+});
+
+// C2.1: snooze button posts toggleSnooze (still true — QuickPick happens on provider side)
+test('renderLaunchpadHtml: snooze button still posts toggleSnooze (QuickPick is on provider side)', () => {
+  const categorized = [{ pr: pr(), bucket: 'waiting' as const }];
+  const html = renderLaunchpadHtml({ categorized, errors: [], now }, opts);
+  assert.match(html, /type: 'toggleSnooze', key: btn\.dataset\.key/);
 });

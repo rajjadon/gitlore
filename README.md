@@ -58,7 +58,9 @@ Requires **VS Code 1.85+** and `git` on your `PATH`. Works in Cursor and other V
 
 The current line's author and age, as a muted end-of-line decoration. It updates when you change lines — not on every cursor move — and the hover card adds the full message, relative *and* absolute dates, that commit's diff stat for this file, and the short SHA. Customise the text with `gitLore.blame.format`, or turn it off entirely. If the repo has a `.git-blame-ignore-revs` file (git's own convention for mass-reformat/lint commits you don't want blame attributing to), GitLore detects and respects it automatically — no setting, same as plain `git blame`.
 
-The hover card also has **Compare** / **File History** / **Copy SHA** quick actions, and an **Older** link that steps backward through that exact line's own history (real per-line tracking, not just "commits that touched this file") — ◀ prev / next ▶ through every revision that changed the line, without leaving the hover.
+The hover card also has **Compare** / **File History** / **Copy SHA** quick actions, an **Older** link that steps backward through that exact line's own history (real per-line tracking, not just "commits that touched this file") — ◀ prev / next ▶ through every revision that changed the line, without leaving the hover — and an **Open PR** link that looks up the pull request that shipped this line (appears only when `gitLore.launchpad.enabled` is on, resolved on click with no prompt).
+
+By default blame uses `git blame` as-is. Turn on `gitLore.blame.detectMoves` to pass `-M -C`, which follows lines that were moved or copied between files — more accurate for refactored code but slower on large files.
 
 ### An interactive commit graph, in the panel
 
@@ -164,7 +166,7 @@ Each degrades to an inline hint rather than erroring when no model is registered
 
 ### GitLore Chat — ask your repo's history questions directly
 
-A docked chat panel (**GitLore: Open Chat**) for free-form questions about a repo's history — "who touched this file last", "why did this get rewritten", "what changed between these two tags." The model answers by calling a fixed set of git-backed tools GitLore runs locally against your own repo (file history, line history, a commit's diff, commits between two refs, branches) — no retrieval index, no pre-guessed context, and every tool call is shown in the panel as it happens. Also reachable pre-seeded with a subject via **Ask GitLore About This File/Commit/Pull Request**, from Commit Graph, Commit Details, and Pull Request Details.
+A docked chat panel (**GitLore: Open Chat**) for free-form questions about a repo's history — "who touched this file last", "why did this get rewritten", "what changed between these two tags." The model answers by calling a fixed set of git-backed tools GitLore runs locally against your own repo (file history, line history, a commit's diff, commits between two refs, branches) — no retrieval index, no pre-guessed context, and every tool call is shown in the panel as it happens. Also reachable pre-seeded with a subject via **Ask GitLore About This File/Commit/Line/Pull Request**, from Commit Graph, Commit Details, the blame hover, and Pull Request Details.
 
 Same opt-in gate and privacy contract as every other AI feature: nothing runs unless `gitLore.ai.enabled` is on, and every tool call is a local `git` read — never a network call.
 
@@ -178,6 +180,8 @@ Same opt-in gate and privacy contract as every other AI feature: nothing runs un
 ### Also
 
 - **Issue and PR links** — `#123` in a commit message becomes a link, auto-detected from your remote or pointed at any tracker (Jira included) via a regex and URL template. Visible inline wherever a commit message renders — no separate view of its own.
+- **Find When Text Was Added or Removed** — **GitLore: Find When Text Was Added or Removed** (Command Palette) searches git history for commits that introduced or removed the selected text using `git log -S`/`-G`; results appear in a QuickPick and open Commit Details on pick. Works with any string or regex.
+- **Line-range history** — "Step Through This Line's History" and "Explain This Line's History" both use the editor's full selection when something is selected, so you can trace a block rather than just a single line's ancestry.
 
 ## Commands
 
@@ -191,6 +195,7 @@ Every command is also a title-bar button in the GitLore panel.
 | `GitLore: Show File History` | List commits touching the current file |
 | `GitLore: Show Visual File History` | Open the bubble timeline for the current file |
 | `GitLore: Toggle Inline Blame` | Turn the end-of-line decoration on or off |
+| `GitLore: Load More File History` | Load the next page of commits in the File History tree (internal — triggered by the tree's Load More item, not the Command Palette) |
 | `GitLore: Copy Commit SHA` | Copy a commit's full SHA (from a commit's context menu) |
 | `GitLore: Show File Ownership` | See a file's authors ranked by recency-weighted ownership share (command palette only, no title-bar button) |
 | `GitLore: Show Files That Often Change With This One` | Open the coupled-files QuickPick (from the co-change CodeLens) |
@@ -210,11 +215,23 @@ Every command is also a title-bar button in the GitLore panel.
 | `GitLore: Open Chat` | Open the GitLore Chat panel (also a title-bar button on Commit Graph; needs `gitLore.ai.enabled`) |
 | `GitLore: Ask GitLore About This File` | Open the chat, pre-seeded with the current file |
 | `GitLore: Ask GitLore About This Commit` | Open the chat, pre-seeded with the loaded commit (title-bar button on Commit Details) |
+| `GitLore: Ask GitLore About This Line` | Open the chat, pre-seeded with the current line's blame context |
 | `GitLore: Ask GitLore About This Pull Request` | Open the chat, pre-seeded with the loaded PR (title-bar button on Pull Request Details) |
+| `GitLore: Explain Commit with AI` | Stream a plain-English summary of the open commit (button in Commit Details; needs `gitLore.ai.enabled`) |
+| `GitLore: Explain This Line's History` | Answer "why does this line exist?" from the blame hover (needs `gitLore.ai.enabled`) |
 | `GitLore: Explain Pull Request with AI` | Summarize the loaded PR and flag its riskiest area (button in Pull Request Details; needs `gitLore.ai.enabled`) |
 | `GitLore: Summarize Branch Comparison with AI` | Summarize what the compare branch changes relative to the base (button in Branch Comparison; needs `gitLore.ai.enabled`) |
 | `GitLore: Generate Changelog with AI` | Pick two refs and stream a Markdown changelog into a new editor tab (needs `gitLore.ai.enabled`) |
 | `GitLore: Draft PR Review Comment with AI` | Draft a review comment into the existing comment box (button in Pull Request Details; needs `gitLore.ai.enabled`) |
+| `GitLore: Rename Branch` | Rename the selected branch (from the Explorer's context menu) |
+| `GitLore: Delete Branch` | Delete the selected branch, after confirming (from the Explorer's context menu) |
+| `GitLore: Delete Tag` | Delete the selected tag, after confirming (from the Explorer's context menu) |
+| `GitLore: Add Worktree` | Create a new worktree at a chosen path and branch (from the Explorer's Worktrees section header) |
+| `GitLore: Remove Worktree` | Remove the selected worktree, after confirming (from the Explorer's context menu) |
+| `GitLore: New Stash` | Create a new stash with an optional message (from the Explorer's Stashes section header) |
+| `GitLore: Recover Lost Commit or Branch` | List recent reflog entries and create a branch at whichever one you pick (Command Palette) |
+| `GitLore: Find When Text Was Added or Removed` | Search git history for when a string was introduced or removed (`git log -S`/`-G`), prefilled from selection (Command Palette) |
+| `GitLore: Open Pull Request for Commit` | Look up the PR that contains the current commit and open it in Pull Request Details (from the blame hover; needs `gitLore.launchpad.enabled`) |
 
 ## Settings
 
@@ -224,28 +241,36 @@ Every command is also a title-bar button in the GitLore panel.
 | `gitLore.blame.format` | string | `"{author}, {age}"` | Template for the inline blame text. Tokens: `{author} {age} {date} {message} {sha}` |
 | `gitLore.blame.highlightCurrentLine` | boolean | `true` | Highlight the current line's blame decoration. |
 | `gitLore.blame.ignoreWhitespace` | boolean | `true` | Pass `-w` to git blame to ignore whitespace-only changes. |
+| `gitLore.blame.detectMoves` | boolean | `false` | Pass `-M -C` to git blame to follow lines moved or copied between files. More accurate for refactored code, but slower on large files. |
 | `gitLore.maxBlameFileSize` | number | `1048576` | Skip blame for files larger than this size, in bytes. |
 | `gitLore.maxHistoryItems` | number | `200` | Max commits loaded per file history. |
 | `gitLore.maxGraphItems` | number | `200` | Max commits loaded in the commit graph. |
 | `gitLore.staleCode.enabled` | boolean | `true` | Show a CodeLens above functions and methods that haven't changed in longer than staleThresholdDays. |
 | `gitLore.staleThresholdDays` | number | `180` | Days since a function's or method's last change before it's flagged as stale. |
+| `gitLore.coChange.enabled` | boolean | `true` | Show a CodeLens above the file listing other files that frequently change alongside it (a logical-coupling signal from git history). |
 | `gitLore.ownership.enabled` | boolean | `false` | Show a color mark per line in the editor's overview ruler for that line's author. |
 | `gitLore.fullFileBlame.enabled` | boolean | `false` | Show a hot-to-cold recency gradient as a left-edge mark per line, across the whole file. |
 | `gitLore.issueLinking.enabled` | boolean | `true` | Auto-link issue/PR references in commit messages. |
 | `gitLore.issueLinking.pattern` | string | `"#(\\d+)"` | Regex matching issue references. The first capture group (or the whole match) fills `{issue}` in the URL template. |
 | `gitLore.issueLinking.urlTemplate` | string | `""` | `{issue}`-templated issue URL. Empty = auto-detect from the repo's GitHub/GitLab remote. |
+| `gitLore.ai.enabled` | boolean | `false` | Enable AI features (commit summaries, line explanations, chat). Uses your own model via `vscode.lm` — no key or diff leaves your machine unless this is on. |
+| `gitLore.ai.modelFamily` | string | `"gpt-4o"` | Preferred language model family hint (e.g. `gpt-4o`, `claude-3.5-sonnet`). Falls back to any available model. |
+| `gitLore.ai.maxDiffChars` | number | `8000` | Max diff size, in characters, sent to the model. Longer diffs are truncated. |
+| `gitLore.ai.maxToolIterations` | number | `6` | Max tool-call round trips GitLore Chat makes per question before it stops and shows whatever answer the model has so far. |
+| `gitLore.rebaseEditor.enabled` | boolean | `true` | Use GitLore's Interactive Rebase Editor for git-rebase-todo files. When disabled, they open in the default text editor. |
 | `gitLore.launchpad.enabled` | boolean | `false` | Enable Launchpad, the cross-repo PR triage board. The only setting that makes GitLore call out to a remote host. |
+| `gitLore.launchpad.statusBar.enabled` | boolean | `true` | Show a status-bar item with the number of PRs needing your review. Only active when `gitLore.launchpad.enabled` is also on; when Launchpad is disabled it is never created and makes no network calls. |
 | `gitLore.launchpad.customHosts` | array | `[]` | Self-hosted/custom git-forge instances (GitHub Enterprise Server, Gitea, Forgejo, self-hosted GitLab) Launchpad can't recognize by hostname alone. Each entry: `{ hostname, flavor, apiBaseUrl }`. |
 
 ## Privacy
 
-GitLore runs entirely locally. Your git data never leaves your machine.
+GitLore runs entirely locally. Your git data never leaves your machine — with two opt-in exceptions:
 
-The one network request it makes on its own: author avatars from `gravatar.com`, keyed by an MD5 hash of the commit email — that's Gravatar's own lookup spec, not a security-relevant use of the hash.
+**1. Gravatar avatars** — GitLore fetches author avatars from `gravatar.com` keyed by an MD5 hash of the commit email. This is the only network request GitLore makes on its own, without any opt-in. A few things open your browser when you click them — **Open on GitHub/GitLab/Bitbucket**, **Open Remote in Browser**, issue links — but every URL is built from your local git remote; GitLore doesn't contact the host to construct them.
 
-A few things open your browser, and only when you click them: **Open on GitHub/GitLab/Bitbucket**, **Open Remote in Browser**, and issue links. Every one of those URLs is built locally from your git remote; GitLore doesn't contact the host to construct them.
+**2. Launchpad, its status-bar item, Branch Comparison's Create PR, and "Open PR for this commit"** — all off by default (`gitLore.launchpad.enabled: false`). When enabled, GitLore calls the git host you've explicitly authenticated with — VS Code's own built-in sign-in for GitHub and Azure DevOps Services, or a Personal Access Token you provide for anything else, stored in VS Code's encrypted secret storage. No GitLore backend ever sees your code, your token, or your PR data. The status-bar item (`gitLore.launchpad.statusBar.enabled`, default `true`) is only active when Launchpad is enabled. It loads the same pull-request data the board does, from the same host, once shortly after startup and again when the window regains focus (at most once a minute, and shared with the board so the two never fetch twice). It only uses a sign-in you already have — it never prompts you to sign in — and with Launchpad off it makes no network calls at all.
 
-**Launchpad — and Branch Comparison's Create PR — are the exceptions to "everything is local"**: both are off/inert by default (`gitLore.launchpad.enabled`), and only ever talk to a host you've explicitly authenticated with (VS Code's own built-in sign-in for GitHub and Azure DevOps Services, or a Personal Access Token you provide for anything else, stored in VS Code's encrypted secret storage). No GitLore backend ever sees your code, your token, or your PR data — GitLore talks directly to the host you configured.
+**3. AI features** — off by default (`gitLore.ai.enabled: false`). When enabled, diffs and git context are sent to whatever language model you've already registered with VS Code (e.g. GitHub Copilot Chat) via the built-in `vscode.lm` API. No GitLore backend, no API key, no account. Nothing is sent until you turn it on.
 
 No telemetry. No analytics. No account.
 
@@ -255,7 +280,7 @@ GitLore is not trying to out-feature the bigger, paid alternatives — it's tryi
 
 **What GitLore does** — inline blame and hover, status bar, file history (tree and visual), a self-refreshing commit graph with pull/push, commit details with per-file diffs, an interactive rebase editor, branch comparison, a repo-wide sidebar explorer, a cross-repo PR triage board, AI commit summaries, AI line explanations, AI-drafted commit messages, stale-code detection, ownership and recency heatmaps, and issue linking. All free, forever.
 
-**What it deliberately doesn't** — staging, stashing or committing itself (that's VS Code's own Source Control view; GitLore only helps draft the message that goes there, and the graph links to Source Control for everything else), and anything behind a sign-in.
+**What it deliberately doesn't** — staging or committing itself (that's VS Code's own Source Control view; GitLore only helps draft the message that goes there, and the graph links to Source Control for everything else), and anything behind a sign-in. GitLore can create, apply, and drop stashes (from the sidebar explorer and Stashes section), but it never stages or commits on your behalf.
 
 **What's missing for now** — a file-tree view of changed files (GitLore's diffs list files flat, not nested by folder). See the [changelog](CHANGELOG.md) for the current list.
 

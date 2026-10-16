@@ -1,6 +1,7 @@
 import type { FileChange } from '../git/types';
 import type { ForgeClient } from './ForgeClient';
 import type {
+  CheckDetail,
   CheckStatus,
   ConversationThread,
   CreatePullRequestOptions,
@@ -10,6 +11,7 @@ import type {
   PullRequestSummary,
   ReviewDecision,
   ReviewSubmission,
+  ThreadComment,
 } from './types';
 import { forgeFetch, ForgeHttpError, fetchAllPages, nextLinkFromHeader, mapWithConcurrency, sameLogin } from './forgeFetch';
 
@@ -18,7 +20,14 @@ interface GitLabUser {
 }
 
 interface GitLabPipeline {
+  id: number;
   status: 'success' | 'failed' | 'canceled' | 'skipped' | 'running' | 'pending' | 'created' | 'waiting_for_resource' | 'preparing' | string;
+}
+
+interface GitLabJob {
+  name: string;
+  status: string;
+  web_url?: string;
 }
 
 interface GitLabMergeRequest {
@@ -34,16 +43,19 @@ interface GitLabMergeRequest {
   has_conflicts?: boolean;
   blocking_discussions_resolved?: boolean;
   head_pipeline?: GitLabPipeline | null;
+  sha?: string;
 }
 
 /** A GitLab "discussion" is the thread; `notes` are its comments. Only a `resolvable` discussion (a genuine review conversation, not a plain top-level comment) can be resolved at all. */
 interface GitLabDiscussion {
   id: string;
   notes: Array<{
+    id: number;
     body: string;
     author: GitLabUser | null;
     resolvable: boolean;
     resolved: boolean;
+    created_at?: string;
     /** Only present on a note attached to a specific diff line — absent for a plain discussion note. */
     position?: { new_path?: string; old_path?: string; new_line?: number | null; old_line?: number | null };
   }>;
@@ -63,6 +75,12 @@ interface GitLabDiffFile {
 
 const PASSING_STATUSES = new Set(['success', 'skipped']);
 const FAILING_STATUSES = new Set(['failed', 'canceled']);
+
+function toJobCheckStatus(status: string): CheckStatus {
+  if (PASSING_STATUSES.has(status)) return 'passing';
+  if (FAILING_STATUSES.has(status)) return 'failing';
+  return 'pending';
+}
 
 function computeCheckStatus(pipeline: GitLabPipeline | null | undefined): CheckStatus {
   if (!pipeline) {
@@ -167,6 +185,7 @@ export class GitLabClient implements ForgeClient {
       isDraft: false,
       createdAt: mr.created_at,
       updatedAt: mr.updated_at,
+      headSha: mr.sha ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
@@ -203,8 +222,14 @@ export class GitLabClient implements ForgeClient {
    */
   async getPullRequestDiff(repo: ForgeRepoRef, number: number): Promise<PullRequestDiff> {
     const projectPath = encodeURIComponent(repo.identity);
-    const res = await this.request(`/projects/${projectPath}/merge_requests/${number}/diffs?per_page=100`);
-    const rawFiles = (await res.json()) as GitLabDiffFile[];
+    const rawFiles = await fetchAllPages<GitLabDiffFile>(
+      `/projects/${projectPath}/merge_requests/${number}/diffs?per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitLabDiffFile[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
     const files: FileChange[] = [];
     const diffParts: string[] = [];
     for (const f of rawFiles) {
@@ -218,12 +243,22 @@ export class GitLabClient implements ForgeClient {
     return { files, diff: diffParts.join('\n') };
   }
 
-  /** GitLab has no formal "request changes" review state the way GitHub does (see `computeReviewDecision`'s own comment on this) — there's no endpoint to call, so `'requestChanges'` throws a clear, actionable message rather than silently doing nothing or faking an approval-adjacent action GitLab doesn't have. */
-  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission): Promise<void> {
+  /**
+   * GitLab has no formal "request changes" review state the way GitHub does (see `computeReviewDecision`'s own comment on this) — there's no endpoint to call, so `'requestChanges'` throws a clear, actionable message rather than silently doing nothing or faking an approval-adjacent action GitLab doesn't have.
+   * When `body` is provided, it is posted as a note before the vote. A note failure blocks the vote.
+   */
+  async submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission, body?: string): Promise<void> {
     if (decision === 'requestChanges') {
       throw new Error("GitLab has no \"Request Changes\" review state — leave a comment explaining what needs to change instead");
     }
     const projectPath = encodeURIComponent(repo.identity);
+    if (body && body.trim().length > 0) {
+      // Comment failure is intentional — it blocks the vote so the reviewer's words aren't silently lost.
+      await this.request(`/projects/${projectPath}/merge_requests/${number}/notes`, {
+        method: 'POST',
+        body: JSON.stringify({ body }),
+      });
+    }
     await this.request(`/projects/${projectPath}/merge_requests/${number}/approve`, { method: 'POST' });
   }
 
@@ -235,22 +270,34 @@ export class GitLabClient implements ForgeClient {
     });
   }
 
-  /** Only resolvable discussions are genuine review conversations — a plain top-level comment (e.g. from `addComment`) is its own unresolvable discussion and would just be a dead "Resolve" button if included here. */
+  /** Only resolvable discussions are genuine review conversations — a plain top-level comment (e.g. from `addComment`) is its own unresolvable discussion and would just be a dead "Resolve" button if included here. Paginated via Link headers. */
   async listConversationThreads(repo: ForgeRepoRef, number: number): Promise<ConversationThread[]> {
     const projectPath = encodeURIComponent(repo.identity);
-    const res = await this.request(`/projects/${projectPath}/merge_requests/${number}/discussions?per_page=100`);
-    const discussions = (await res.json()) as GitLabDiscussion[];
+    const discussions = await fetchAllPages<GitLabDiscussion>(
+      `/projects/${projectPath}/merge_requests/${number}/discussions?per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitLabDiscussion[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
     return discussions
       .filter((d) => d.notes[0]?.resolvable)
       .map((d) => {
         const position = d.notes[0]?.position;
         const file = position?.new_path ?? position?.old_path;
         const line = position?.new_line ?? position?.old_line ?? undefined;
+        const comments: ThreadComment[] = d.notes.map((n) => ({
+          authorLogin: n.author?.username ?? '',
+          body: n.body,
+          ...(n.created_at ? { createdAt: n.created_at } : {}),
+        }));
         return {
           id: d.id,
           body: d.notes[0]?.body ?? '',
           authorLogin: d.notes[0]?.author?.username ?? '',
           resolved: d.notes[0]?.resolved ?? false,
+          comments,
           ...(file !== undefined ? { file } : {}),
           ...(line !== undefined ? { line } : {}),
         };
@@ -260,6 +307,45 @@ export class GitLabClient implements ForgeClient {
   async resolveConversationThread(repo: ForgeRepoRef, number: number, threadId: string): Promise<void> {
     const projectPath = encodeURIComponent(repo.identity);
     await this.request(`/projects/${projectPath}/merge_requests/${number}/discussions/${threadId}?resolved=true`, { method: 'PUT' });
+  }
+
+  /** Adds a reply note to a discussion thread (`POST .../discussions/:id/notes`). */
+  async replyToThread(repo: ForgeRepoRef, number: number, threadId: string, body: string): Promise<void> {
+    const projectPath = encodeURIComponent(repo.identity);
+    await this.request(`/projects/${projectPath}/merge_requests/${number}/discussions/${threadId}/notes`, {
+      method: 'POST',
+      body: JSON.stringify({ body }),
+    });
+  }
+
+  /** Unresolves a discussion thread (`PUT .../discussions/:id?resolved=false`). */
+  async unresolveConversationThread(repo: ForgeRepoRef, number: number, threadId: string): Promise<void> {
+    const projectPath = encodeURIComponent(repo.identity);
+    await this.request(`/projects/${projectPath}/merge_requests/${number}/discussions/${threadId}?resolved=false`, { method: 'PUT' });
+  }
+
+  /** Lists pipeline jobs as checks. Fetches the MR for its head_pipeline.id, then paginates the jobs endpoint. Returns empty when no pipeline is associated. */
+  async listChecks(repo: ForgeRepoRef, number: number): Promise<CheckDetail[]> {
+    const projectPath = encodeURIComponent(repo.identity);
+    const mrRes = await this.request(`/projects/${projectPath}/merge_requests/${number}`);
+    const mr = (await mrRes.json()) as GitLabMergeRequest;
+    if (!mr.head_pipeline) {
+      return [];
+    }
+    const pipelineId = mr.head_pipeline.id;
+    const jobs = await fetchAllPages<GitLabJob>(
+      `/projects/${projectPath}/pipelines/${pipelineId}/jobs?per_page=100`,
+      async (url) => {
+        const res = await this.request(url);
+        const items = (await res.json()) as GitLabJob[];
+        return { items, next: nextLinkFromHeader(res.headers.get('link')) };
+      },
+    );
+    return jobs.map((job) => ({
+      name: job.name,
+      status: toJobCheckStatus(job.status),
+      ...(job.web_url ? { url: job.web_url } : {}),
+    }));
   }
 
   /** GitLab's merge endpoint only exposes a `squash` boolean, not a distinct strategy field — there's no request that gives `'rebase'` a separate merge-commit-free history the way GitHub/Azure DevOps' rebase does, so it throws rather than silently merging with the wrong history shape (see `MERGE_STRATEGIES_BY_HOST`). */
@@ -292,12 +378,36 @@ export class GitLabClient implements ForgeClient {
       isDraft: data.draft ?? data.work_in_progress ?? options.draft,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
+      headSha: data.sha ?? '',
       requestedReviewers: [],
       checkStatus: 'none',
       reviewDecision: 'none',
       hasConflicts: false,
       reviewedByMe: false,
     };
+  }
+
+  /**
+   * One page only — a commit is in very few MRs. `state: 'merged'` is preferred over `'opened'`
+   * or `'closed'`. 404 means the commit is unknown to this GitLab instance — treated as null.
+   */
+  async findPullRequestForCommit(repo: ForgeRepoRef, sha: string): Promise<{ number: number; title: string; url: string } | null> {
+    const projectPath = encodeURIComponent(repo.identity);
+    try {
+      const res = await this.request(`/projects/${projectPath}/repository/commits/${sha}/merge_requests?per_page=100`);
+      const mrs = (await res.json()) as Array<{ iid: number; title: string; web_url: string; state: string }>;
+      // Prefer merged over opened/closed.
+      const chosen = mrs.find((mr) => mr.state === 'merged') ?? mrs[0];
+      if (!chosen) {
+        return null;
+      }
+      return { number: chosen.iid, title: chosen.title, url: chosen.web_url };
+    } catch (err) {
+      if (err instanceof ForgeHttpError && err.kind === 'http' && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   private async enrich(repo: ForgeRepoRef, projectPath: string, mr: GitLabMergeRequest): Promise<PullRequestSummary> {
@@ -318,6 +428,7 @@ export class GitLabClient implements ForgeClient {
       isDraft: mr.draft ?? mr.work_in_progress ?? false,
       createdAt: mr.created_at,
       updatedAt: mr.updated_at,
+      headSha: mr.sha ?? '',
       requestedReviewers: stillOwed,
       checkStatus: computeCheckStatus(mr.head_pipeline),
       reviewDecision: computeReviewDecision(mr, approvals.approved, stillOwed),

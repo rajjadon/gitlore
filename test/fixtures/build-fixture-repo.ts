@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -19,6 +19,9 @@ export interface FixtureManifest {
 
 /** Where runTests.ts writes the manifest so the suite running inside the Extension Development Host can read it back. */
 export const MANIFEST_PATH = join(tmpdir(), 'gitlore-fixture-manifest.json');
+
+/** Separate path for the submodule fixture manifest (F5.1). */
+export const SUBMODULE_MANIFEST_PATH = join(tmpdir(), 'gitlore-submodule-manifest.json');
 
 function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): void {
   execFileSync('git', args, { cwd, env: { ...process.env, ...env }, stdio: 'pipe' });
@@ -404,4 +407,65 @@ export function buildSyncFixtureRepo(): SyncFixtureManifest {
   git(repoRoot, ['checkout', '-q', 'main']);
 
   return { repoRoot, trackedFile, ahead, behind };
+}
+
+export interface SubmoduleFixtureManifest {
+  /** The parent (super-project) repo root. */
+  parentRoot: string;
+  /** Path to the submodule's working tree root inside the parent (parent/sub). */
+  submoduleRoot: string;
+  /** A tracked file inside the submodule working tree. */
+  submoduleFile: string;
+  /** SHA of the commit that last touched `submoduleFile`. */
+  submoduleCommitSha: string;
+}
+
+/**
+ * A parent repo with one real git submodule added via the `file://` protocol
+ * (`git -c protocol.file.allow=always submodule add`).  The submodule itself has one
+ * tracked file with one commit so blame and file-history can be exercised against it.
+ *
+ * The submodule is fully initialized: the sub-repo's working tree exists at `parentRoot/sub`
+ * with a regular `.git` file (not a directory) pointing back into `parentRoot/.git/modules/sub`.
+ *
+ * Git's behaviour: `git rev-parse --show-toplevel` inside `parentRoot/sub` resolves to
+ * `parentRoot/sub`, not `parentRoot` — so `GitService.getRepoRoot(submoduleFile)` returns the
+ * submodule root, and all blame / history calls operate against the submodule's own object store.
+ */
+export function buildSubmoduleFixtureRepo(): SubmoduleFixtureManifest {
+  // 1. Build a self-contained sub-repo that will become the submodule source.
+  const subSrcRoot = mkdtempSync(join(tmpdir(), 'gitlore-submodule-src-'));
+  git(subSrcRoot, ['init', '-q', '-b', 'main']);
+  git(subSrcRoot, ['config', 'user.name', 'Raj Jadon']);
+  git(subSrcRoot, ['config', 'user.email', 'raj@example.com']);
+
+  const subSrcFile = join(subSrcRoot, 'sub.txt');
+  writeFileSync(subSrcFile, 'submodule line one\n');
+  git(subSrcRoot, ['add', 'sub.txt']);
+  git(subSrcRoot, ['commit', '-q', '-m', 'sub: add sub.txt'], commitEnv('Raj Jadon', 'raj@example.com', '2024-01-01T10:00:00'));
+
+  const submoduleCommitSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: subSrcRoot }).toString().trim();
+
+  // 2. Build the parent repo and add the sub-repo as a submodule.
+  // Canonicalize immediately: on macOS os.tmpdir() returns a /var/... symlink but
+  // `git rev-parse --show-toplevel` resolves to /private/var/..., causing assert.equal to
+  // fail when comparing manifest.submoduleRoot with getRepoRoot()'s output.
+  const parentRoot = realpathSync(mkdtempSync(join(tmpdir(), 'gitlore-submodule-parent-')));
+  git(parentRoot, ['init', '-q', '-b', 'main']);
+  git(parentRoot, ['config', 'user.name', 'Raj Jadon']);
+  git(parentRoot, ['config', 'user.email', 'raj@example.com']);
+
+  // Add a root commit so the parent has a valid HEAD before the submodule add.
+  writeFileSync(join(parentRoot, 'README.txt'), 'parent repo\n');
+  git(parentRoot, ['add', 'README.txt']);
+  git(parentRoot, ['commit', '-q', '-m', 'parent: initial'], commitEnv('Raj Jadon', 'raj@example.com', '2024-01-01T09:00:00'));
+
+  // `protocol.file.allow=always` is required on git ≥ 2.38.1 for local file:// submodule URLs.
+  git(parentRoot, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', `file://${subSrcRoot}`, 'sub']);
+  git(parentRoot, ['commit', '-q', '-m', 'parent: add sub submodule'], commitEnv('Raj Jadon', 'raj@example.com', '2024-01-02T10:00:00'));
+
+  const submoduleRoot = join(parentRoot, 'sub');
+  const submoduleFile = join(submoduleRoot, 'sub.txt');
+
+  return { parentRoot, submoduleRoot, submoduleFile, submoduleCommitSha };
 }

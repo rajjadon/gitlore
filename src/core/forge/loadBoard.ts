@@ -20,6 +20,12 @@ export interface BoardDeps {
   logError: (message: string, err: unknown) => void;
   /** Max parallel per-repo loads. Default 4. */
   concurrency?: number;
+  /**
+   * Last successful data per repo, keyed by `"host:identity"`. When a repo's refresh fails but a
+   * previous good result exists, its PRs are kept in `categorized` with `stale: true` alongside
+   * the error row. The first-ever failure (no previous data) behaves as before — error row only.
+   */
+  previousByRepoKey?: Map<string, { login: string; open: PullRequestSummary[]; closed: PullRequestSummary[] }>;
 }
 
 export interface BoardResult {
@@ -79,7 +85,7 @@ async function loadOne(
 }
 
 export async function loadBoard(deps: BoardDeps): Promise<BoardResult> {
-  const { repos, isSnoozed, onCredentialRejected, logError, concurrency = 4 } = deps;
+  const { repos, isSnoozed, onCredentialRejected, logError, concurrency = 4, previousByRepoKey } = deps;
 
   const outcomes = await mapWithConcurrency(repos, concurrency, (repoInput) =>
     loadOne(repoInput, isSnoozed, onCredentialRejected, logError),
@@ -93,6 +99,15 @@ export async function loadBoard(deps: BoardDeps): Promise<BoardResult> {
   for (const outcome of outcomes) {
     if ('error' in outcome) {
       errors.push({ repo: outcome.repo, message: outcome.error });
+      // C3.2: if a previous good result exists, keep showing those PRs as stale
+      const prev = previousByRepoKey?.get(repoKey(outcome.repo));
+      if (prev) {
+        const staleCategorized = [
+          ...categorizePullRequests(prev.open, prev.login, isSnoozed),
+          ...categorizeClosedPullRequests(prev.closed, prev.login),
+        ].map((c) => ({ ...c, stale: true as const }));
+        categorized.push(...staleCategorized);
+      }
       continue;
     }
     const key = repoKey(outcome.repo);
@@ -120,11 +135,6 @@ export function recategorize(
     );
   }
   return categorized;
-}
-
-/** Drop snoozed keys that no longer match any live PR — keeps the globalState set tidy. Pure. */
-export function pruneSnoozed(keys: string[], livePrKeys: Set<string>): string[] {
-  return keys.filter((k) => livePrKeys.has(k));
 }
 
 /** Collect all PR keys from a rawByRepoKey map — used by the provider after each full load. */

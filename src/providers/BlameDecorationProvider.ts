@@ -132,7 +132,8 @@ export class BlameDecorationProvider implements vscode.Disposable {
     }
 
     const ignoreWhitespace = this.getConfig<boolean>(CONFIG.blameIgnoreWhitespace, true);
-    const blameLines = await this.source.getBlameLines(filePath, { ignoreWhitespace });
+    const detectMoves = this.getConfig<boolean>(CONFIG.blameDetectMoves, false);
+    const blameLines = await this.source.getBlameLines(filePath, { ignoreWhitespace, detectMoves });
     const entry = blameLines?.find((l: BlameLine) => l.line === line) ?? null;
     if (!entry) {
       this.clearDecoration(editor);

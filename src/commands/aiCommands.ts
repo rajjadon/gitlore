@@ -9,6 +9,7 @@ import type { ChangelogService } from '../ai/ChangelogService';
 import type { GitService } from '../core/git/GitService';
 import { resolveRepoContextPath } from '../views/CommitGraph/CommitGraphViewProvider';
 import { describeNoModelReason } from '../core/ai/modelAvailability';
+import { showAiDisabledNotice } from '../ai/showAiDisabledNotice';
 
 /** The subset of `vscode.git`'s exported API GitLore uses — not part of `@types/vscode`, so declared locally. */
 interface GitExtensionApi {
@@ -144,11 +145,7 @@ export function handleGenerateCommitMessageCommand(service: CommitMessageService
           }
           switch (event.type) {
             case 'disabled':
-              void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-                if (choice) {
-                  void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-                }
-              });
+              void showAiDisabledNotice();
               break;
             case 'noStagedChanges':
               void vscode.window.showInformationMessage('GitLore: stage some changes first.');
@@ -212,11 +209,7 @@ export function handleGenerateChangelogCommand(service: ChangelogService, git: G
         for await (const event of service.generate(filePath, from, to, controller.signal)) {
           switch (event.type) {
             case 'disabled':
-              void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-                if (choice) {
-                  void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-                }
-              });
+              void showAiDisabledNotice();
               break;
             case 'noCommits':
               void vscode.window.showInformationMessage(`GitLore: no commits between ${from} and ${to}.`);

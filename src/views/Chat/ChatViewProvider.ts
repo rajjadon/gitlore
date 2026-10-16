@@ -5,15 +5,8 @@ import { waitForWebviewView } from '../waitForWebviewView';
 import type { ChatService } from '../../ai/ChatService';
 import { describeNoModelReason } from '../../core/ai/modelAvailability';
 import { MEDIA, VIEWS } from '../../constants';
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
+import { createNonce } from '../nonce';
+import { showAiDisabledNotice } from '../../ai/showAiDisabledNotice';
 
 /** Docks the chat in the bottom panel, alongside every other GitLore view. */
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -105,11 +98,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       switch (event.type) {
         case 'disabled':
-          void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-            if (choice) {
-              void vscode.commands.executeCommand('workbench.action.openSettings', 'gitLore.ai.enabled');
-            }
-          });
+          void showAiDisabledNotice();
           this.postChatMessage({ type: 'chatReset' });
           break;
         case 'noModel':

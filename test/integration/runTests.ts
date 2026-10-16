@@ -2,7 +2,7 @@ import { writeFileSync, existsSync, readdirSync, statSync, mkdtempSync } from 'n
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runTests, downloadAndUnzipVSCode } from '@vscode/test-electron';
-import { buildFixtureRepo, MANIFEST_PATH } from '../fixtures/build-fixture-repo';
+import { buildFixtureRepo, MANIFEST_PATH, buildSubmoduleFixtureRepo, SUBMODULE_MANIFEST_PATH } from '../fixtures/build-fixture-repo';
 
 /**
  * `@vscode/test-electron` 2.5.2 hardcodes the macOS app's executable name as `Electron`,
@@ -25,6 +25,9 @@ async function resolveVscodeExecutablePath(): Promise<string> {
 async function main(): Promise<void> {
   const manifest = buildFixtureRepo();
   writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
+
+  const submoduleManifest = buildSubmoduleFixtureRepo();
+  writeFileSync(SUBMODULE_MANIFEST_PATH, JSON.stringify(submoduleManifest, null, 2));
 
   // __dirname here is out-test/test/integration; the extension (and its package.json) lives at the project root.
   const extensionDevelopmentPath = join(__dirname, '..', '..', '..');

@@ -97,6 +97,7 @@ function pr(): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
   };
 }
 
@@ -155,7 +156,7 @@ test('buildChangelogPrompt: truncates a diff over maxDiffChars', () => {
 });
 
 test('buildPrReviewDraftPrompt: includes the PR title, diff, and existing conversation context', () => {
-  const threads: ConversationThread[] = [{ id: 't1', body: 'Is this thread-safe?', authorLogin: 'amy', resolved: false }];
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Is this thread-safe?', authorLogin: 'amy', resolved: false, comments: [] }];
   const prompt = buildPrReviewDraftPrompt(pr(), 'diff --git a/x.ts b/x.ts\n+thing();', threads, 8000);
   assert.match(prompt, /Fix flaky retry logic/);
   assert.match(prompt, /thing\(\);/);

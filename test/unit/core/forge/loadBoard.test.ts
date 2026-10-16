@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import type { ForgeClient } from '../../../../src/core/forge/ForgeClient';
 import type { ForgeRepoRef, PullRequestSummary } from '../../../../src/core/forge/types';
 import { ForgeHttpError } from '../../../../src/core/forge/forgeFetch';
-import { loadBoard, recategorize, pruneSnoozed } from '../../../../src/core/forge/loadBoard';
+import { loadBoard, recategorize } from '../../../../src/core/forge/loadBoard';
+import { pruneSnoozed } from '../../../../src/core/forge/snoozeStore';
+import type { SnoozeStore } from '../../../../src/core/forge/snoozeStore';
 
 // Minimal PullRequestSummary builder
 function makePr(overrides: Partial<PullRequestSummary> & { number: number; authorLogin: string }): PullRequestSummary {
@@ -21,6 +23,7 @@ function makePr(overrides: Partial<PullRequestSummary> & { number: number; autho
     reviewDecision: 'none',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
   };
   return { ...base, ...overrides };
 }
@@ -365,24 +368,99 @@ describe('recategorize', () => {
 });
 
 describe('pruneSnoozed', () => {
-  it('removes keys not in livePrKeys', () => {
-    const result = pruneSnoozed(['a:r#1', 'a:r#2', 'a:r#3'], new Set(['a:r#2']));
-    assert.deepEqual(result, ['a:r#2']);
+  // All tests pass refreshedRepoKeys so that pruning is actually exercised.
+  // Repo key = everything before the last '#' in a PR key (e.g. 'a:r' for 'a:r#1').
+  it('removes keys not in livePrKeys for a refreshed repo', () => {
+    const store: SnoozeStore = { 'a:r#1': { until: 1 }, 'a:r#2': { updatedAt: 'x' }, 'a:r#3': { until: 2 } };
+    const result = pruneSnoozed(store, new Set(['a:r#2']), new Set(['a:r']));
+    assert.deepEqual(Object.keys(result), ['a:r#2']);
   });
 
-  it('keeps all when all are live', () => {
-    const keys = ['a:r#1', 'a:r#2'];
-    const result = pruneSnoozed(keys, new Set(keys));
-    assert.deepEqual(result, keys);
+  it('keeps all when all are live in a refreshed repo', () => {
+    const store: SnoozeStore = { 'a:r#1': { until: 1 }, 'a:r#2': { updatedAt: 'x' } };
+    const result = pruneSnoozed(store, new Set(['a:r#1', 'a:r#2']), new Set(['a:r']));
+    assert.equal(Object.keys(result).length, 2);
   });
 
-  it('returns empty when no keys are live', () => {
-    const result = pruneSnoozed(['a:r#1', 'a:r#2'], new Set());
-    assert.deepEqual(result, []);
+  it('returns empty when no keys are live in a refreshed repo', () => {
+    const store: SnoozeStore = { 'a:r#1': { until: 1 }, 'a:r#2': { updatedAt: 'x' } };
+    const result = pruneSnoozed(store, new Set(), new Set(['a:r']));
+    assert.deepEqual(result, {});
   });
 
-  it('handles empty input', () => {
-    const result = pruneSnoozed([], new Set(['a:r#1']));
-    assert.deepEqual(result, []);
+  it('handles empty store', () => {
+    const result = pruneSnoozed({}, new Set(['a:r#1']), new Set(['a:r']));
+    assert.deepEqual(result, {});
+  });
+});
+
+describe('C3.2 stale data', () => {
+  it('when a repo refresh fails and previousByRepoKey has data, keeps those PRs as stale', async () => {
+    const previousPr = makePr({ number: 42, authorLogin: 'alice', repo: repoA });
+    const failingClient = {
+      async getAuthenticatedLogin() { return 'alice'; },
+      async listOpenPullRequests() {
+        throw new Error('network error');
+      },
+      async listRecentlyClosedPullRequests() { return []; },
+      async closePullRequest() { /* no-op */ },
+      async reopenPullRequest() { /* no-op */ },
+      async mergePullRequest() { /* no-op */ },
+      async createPullRequest() { throw new Error('not implemented'); },
+      async getPullRequest() { throw new Error('not implemented'); },
+      async getPullRequestDiff() { throw new Error('not implemented'); },
+      async submitReview() { /* no-op */ },
+      async addComment() { /* no-op */ },
+      async listConversationThreads() { return []; },
+      async resolveConversationThread() { /* no-op */ },
+    } as unknown as ForgeClient;
+
+    const previousByRepoKey = new Map([
+      [`${repoA.host}:${repoA.identity}`, { login: 'alice', open: [previousPr], closed: [] }],
+    ]);
+
+    const result = await loadBoard({
+      repos: [{ repo: repoA, client: failingClient, displayHost: 'github.com' }],
+      isSnoozed: () => false,
+      onCredentialRejected: async () => { /* no-op */ },
+      logError: () => { /* no-op */ },
+      previousByRepoKey,
+    });
+
+    // Error row still present
+    assert.equal(result.errors.length, 1);
+    // Stale PRs from previous load still in categorized
+    const stalePr = result.categorized.find((c) => c.pr.number === 42);
+    assert.ok(stalePr, 'stale PR should still appear in categorized');
+    assert.equal(stalePr?.stale, true, 'stale PR should be marked stale');
+  });
+
+  it('first-ever failure (no previousByRepoKey entry): no stale PRs, just the error row', async () => {
+    const failingClient = {
+      async getAuthenticatedLogin() { return 'alice'; },
+      async listOpenPullRequests() { throw new Error('network error'); },
+      async listRecentlyClosedPullRequests() { return []; },
+      async closePullRequest() { /* no-op */ },
+      async reopenPullRequest() { /* no-op */ },
+      async mergePullRequest() { /* no-op */ },
+      async createPullRequest() { throw new Error('not implemented'); },
+      async getPullRequest() { throw new Error('not implemented'); },
+      async getPullRequestDiff() { throw new Error('not implemented'); },
+      async submitReview() { /* no-op */ },
+      async addComment() { /* no-op */ },
+      async listConversationThreads() { return []; },
+      async resolveConversationThread() { /* no-op */ },
+    } as unknown as ForgeClient;
+
+    const result = await loadBoard({
+      repos: [{ repo: repoA, client: failingClient, displayHost: 'github.com' }],
+      isSnoozed: () => false,
+      onCredentialRejected: async () => { /* no-op */ },
+      logError: () => { /* no-op */ },
+      // No previousByRepoKey
+    });
+
+    assert.equal(result.errors.length, 1);
+    assert.equal(result.categorized.length, 0, 'first-ever failure: no stale PRs');
   });
 });

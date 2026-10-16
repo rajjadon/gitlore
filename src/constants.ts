@@ -31,6 +31,7 @@ export const COMMANDS = {
   toggleFullFileBlame: 'gitLore.toggleFullFileBlame',
   openLaunchpad: 'gitLore.openLaunchpad',
   showPullRequest: 'gitLore.showPullRequest',
+  findWhenTextChanged: 'gitLore.findWhenTextChanged',
   openChat: 'gitLore.openChat',
   askAboutFile: 'gitLore.askAboutFile',
   askAboutCommit: 'gitLore.askAboutCommit',
@@ -50,6 +51,12 @@ export const COMMANDS = {
   removeWorktreeFromExplorer: 'gitLore.removeWorktreeFromExplorer',
   createStashFromExplorer: 'gitLore.createStashFromExplorer',
   recoverFromReflog: 'gitLore.recoverFromReflog',
+  /**
+   * Resolves the PR (if any) associated with a specific commit SHA and opens it. Hidden from the
+   * command palette — it's only meant to be triggered from the blame hover card, with a sha argument.
+   * Shares the `gitLore.launchpad.enabled` toggle: this feature also calls out to a remote host.
+   */
+  openPullRequestForCommit: 'gitLore.openPullRequestForCommit',
 } as const;
 
 export const CONFIG = {
@@ -58,6 +65,7 @@ export const CONFIG = {
   blameFormat: 'blame.format',
   blameHighlightCurrentLine: 'blame.highlightCurrentLine',
   blameIgnoreWhitespace: 'blame.ignoreWhitespace',
+  blameDetectMoves: 'blame.detectMoves',
   maxHistoryItems: 'maxHistoryItems',
   maxBlameFileSize: 'maxBlameFileSize',
   maxGraphItems: 'maxGraphItems',
@@ -76,6 +84,7 @@ export const CONFIG = {
   rebaseEditorEnabled: 'rebaseEditor.enabled',
   launchpadEnabled: 'launchpad.enabled',
   launchpadCustomHosts: 'launchpad.customHosts',
+  launchpadStatusBarEnabled: 'launchpad.statusBar.enabled',
 } as const;
 
 export const VIEWS = {
@@ -120,3 +129,6 @@ export const SCHEMES = {
 export const CONTEXT_KEYS = {
   fileHistoryHasContent: 'gitLore.fileHistory.hasContent',
 } as const;
+
+/** globalState key for the Launchpad snooze store (`Record<prKey, SnoozeEntry>`). */
+export const SNOOZE_STATE_KEY = 'gitLore.launchpad.snoozed';

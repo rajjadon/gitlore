@@ -771,35 +771,31 @@ test('addComment: POSTs a new single-comment thread matching the documented shap
 });
 
 test('listConversationThreads: excludes deleted threads and system-generated ones (vote-change notifications)', async () => {
-  const client = new AzureDevOpsClient(
-    IDENTITY,
-    'pat',
-    'pat',
-    fakeFetch({
-      'pullrequests/56/threads?api-version=7.1': {
+  // fetchAllSkip appends $top/$skip; match on a URL substring that's stable across all pages
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      return jsonResponse({
         value: [
           { id: 1, status: 'active', comments: [{ content: 'Fix this', author: { uniqueName: 'amy@acme.com' }, commentType: 'text' }] },
           { id: 2, status: 'fixed', comments: [{ content: 'Already fine', author: { uniqueName: 'raj@acme.com' }, commentType: 'text' }] },
           { id: 3, status: 'closed', isDeleted: true, comments: [{ content: 'Deleted', author: { uniqueName: 'raj@acme.com' }, commentType: 'text' }] },
           { id: 4, status: 'active', comments: [{ content: 'raj voted 10', author: { uniqueName: 'raj@acme.com' }, commentType: 'system' }] },
         ],
-      },
-    }),
-  );
+      });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
   const result = await client.listConversationThreads(REPO, 56);
   assert.deepEqual(result, [
-    { id: '1', body: 'Fix this', authorLogin: 'amy@acme.com', resolved: false },
-    { id: '2', body: 'Already fine', authorLogin: 'raj@acme.com', resolved: true },
+    { id: '1', body: 'Fix this', authorLogin: 'amy@acme.com', resolved: false, comments: [{ authorLogin: 'amy@acme.com', body: 'Fix this' }] },
+    { id: '2', body: 'Already fine', authorLogin: 'raj@acme.com', resolved: true, comments: [{ authorLogin: 'raj@acme.com', body: 'Already fine' }] },
   ]);
 });
 
 test('listConversationThreads: surfaces the file/line a code thread is anchored to', async () => {
-  const client = new AzureDevOpsClient(
-    IDENTITY,
-    'pat',
-    'pat',
-    fakeFetch({
-      'pullrequests/56/threads?api-version=7.1': {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      return jsonResponse({
         value: [
           {
             id: 1,
@@ -808,11 +804,12 @@ test('listConversationThreads: surfaces the file/line a code thread is anchored 
             threadContext: { filePath: '/src/a.ts', rightFileStart: { line: 42 } },
           },
         ],
-      },
-    }),
-  );
+      });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
   const result = await client.listConversationThreads(REPO, 56);
-  assert.deepEqual(result, [{ id: '1', body: 'Fix this', authorLogin: 'amy@acme.com', resolved: false, file: '/src/a.ts', line: 42 }]);
+  assert.deepEqual(result, [{ id: '1', body: 'Fix this', authorLogin: 'amy@acme.com', resolved: false, file: '/src/a.ts', line: 42, comments: [{ authorLogin: 'amy@acme.com', body: 'Fix this' }] }]);
 });
 
 test('resolveConversationThread: PATCHes status="fixed" (the enum name, not a number) to the thread endpoint', async () => {
@@ -976,4 +973,253 @@ test('A4: enrich fan-out is bounded — concurrent enrichment calls stay within 
   await client.listOpenPullRequests(REPO);
   assert.ok(maxConcurrentEnrichs <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentEnrichs}`);
   assert.ok(maxConcurrentEnrichs > 1, 'must use some concurrency (not fully serial)');
+});
+
+// ── B1.1: headSha in PullRequestSummary ───────────────────────────────────
+
+test('B1.1: enrich populates headSha from lastMergeSourceCommit.commitId', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/7?')) {
+      return jsonResponse({ pullRequestId: 7, title: 'PR', createdBy: { uniqueName: 'raj@acme.com' }, creationDate: 'c', lastMergeSourceCommit: { commitId: 'deadbeef' } });
+    }
+    if (url.includes('/statuses')) return jsonResponse({ value: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequest(REPO, 7);
+  assert.equal(result.headSha, 'deadbeef');
+});
+
+test('B1.1: fetchClosedList populates headSha (empty string when lastMergeSourceCommit absent)', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('profile')) return jsonResponse({ id: 'uid-1', emailAddress: 'raj@acme.com' });
+    if (url.includes('status=completed')) return jsonResponse({ value: [{ pullRequestId: 30, title: 'Closed', createdBy: { uniqueName: 'raj@acme.com' }, creationDate: 'c', closedDate: 'c2', lastMergeSourceCommit: { commitId: 'cafebabe' } }] });
+    if (url.includes('status=abandoned')) return jsonResponse({ value: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  await client.getAuthenticatedLogin();
+  const result = await client.listRecentlyClosedPullRequests(REPO);
+  assert.equal(result[0]?.headSha, 'cafebabe');
+});
+
+// ── B1.2: pagination — iterations/changes and threads ────────────────────
+
+test('B1.2: fetchIterationChanges paginates via $top/$skip — returns entries from both pages', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/iterations?')) {
+      return jsonResponse({ value: [{ id: 1 }] });
+    }
+    if (url.includes('/iterations/1/changes')) {
+      callCount++;
+      if (url.includes('$skip=0')) {
+        // Full page of 100 entries
+        return jsonResponse({ changeEntries: Array.from({ length: 100 }, (_, i) => ({ item: { path: `/a${i}.ts` }, changeType: 'edit' })) });
+      }
+      // Second page (short)
+      return jsonResponse({ changeEntries: [{ item: { path: '/b.ts' }, changeType: 'edit' }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 100);
+  assert.equal(callCount, 2, 'must page twice for 101 entries');
+  assert.equal(result.files.length, 101);
+});
+
+test('B1.2: listConversationThreads paginates threads via $top/$skip (2 pages)', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      callCount++;
+      if (url.includes('$skip=0')) {
+        return jsonResponse({ value: Array.from({ length: 100 }, (_, i) => ({ id: i + 1, status: 'active', comments: [{ content: `T${i + 1}`, author: { uniqueName: 'a@b.com' }, commentType: 'text' }] })) });
+      }
+      return jsonResponse({ value: [{ id: 101, status: 'active', comments: [{ content: 'T101', author: { uniqueName: 'a@b.com' }, commentType: 'text' }] }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 56);
+  assert.equal(callCount, 2, 'must page twice');
+  assert.equal(result.length, 101);
+});
+
+// B1.2 boundary: Azure iterations/changes — 100 entries (single page), cap
+
+test('B1.2: fetchIterationChanges — exactly 100 entries single page, no second request', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/iterations?')) return jsonResponse({ value: [{ id: 1 }] });
+    if (url.includes('/iterations/1/changes')) {
+      callCount++;
+      // 99 entries (< 100) → short page → stops
+      return jsonResponse({ changeEntries: Array.from({ length: 99 }, (_, i) => ({ item: { path: `/a${i}.ts` }, changeType: 'edit' })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 100);
+  assert.equal(callCount, 1, 'single changes request for 99 entries (short page)');
+  assert.equal(result.files.length, 99);
+});
+
+test('B1.2: fetchIterationChanges — always-full pages stop at MAX_PAGES (10)', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/iterations?')) return jsonResponse({ value: [{ id: 1 }] });
+    if (url.includes('/iterations/1/changes')) {
+      callCount++;
+      // Always return full 100 entries → cap at MAX_PAGES=10
+      return jsonResponse({ changeEntries: Array.from({ length: 100 }, (_, i) => ({ item: { path: `/c${callCount}_${i}.ts` }, changeType: 'edit' })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 100);
+  assert.equal(callCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.files.length, 1000, '10 pages × 100 entries = 1000');
+});
+
+// B1.2 boundary: Azure /threads — 100 threads (single page), cap
+
+test('B1.2: listConversationThreads — exactly 100 threads single page ($top=100, short page stops)', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      callCount++;
+      // 99 threads → short page → fetchAllSkip stops
+      return jsonResponse({ value: Array.from({ length: 99 }, (_, i) => ({ id: i + 1, status: 'active', comments: [{ content: 'T', author: { uniqueName: 'u@a.com' }, commentType: 'text' }] })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 56);
+  assert.equal(callCount, 1, 'single /threads request for short page');
+  assert.equal(result.length, 99);
+});
+
+test('B1.2: listConversationThreads — always-full thread pages stop at MAX_PAGES (10)', async () => {
+  let callCount = 0;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      callCount++;
+      // Always return full 100 threads → cap at MAX_PAGES=10
+      return jsonResponse({ value: Array.from({ length: 100 }, (_, i) => ({ id: callCount * 100 + i + 1, status: 'active', comments: [{ content: 'T', author: { uniqueName: 'u@a.com' }, commentType: 'text' }] })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 56);
+  assert.equal(callCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.length, 1000, '10 pages × 100 threads = 1000');
+});
+
+// ── B2.1: ConversationThread.comments array ────────────────────────────────
+
+test('B2.1: listConversationThreads maps all non-system comments to ThreadComment[] with publishedDate', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullrequests/56/threads')) {
+      return jsonResponse({
+        value: [{
+          id: 1, status: 'active',
+          comments: [
+            { content: 'Root', author: { uniqueName: 'amy@acme.com' }, commentType: 'text', publishedDate: '2024-01-01T00:00:00Z' },
+            { content: 'Reply', author: { uniqueName: 'raj@acme.com' }, commentType: 'text', publishedDate: '2024-01-02T00:00:00Z' },
+            { content: 'auto', author: { uniqueName: 'system' }, commentType: 'system' },
+          ],
+        }],
+      });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 56);
+  assert.equal(result[0]?.comments.length, 2, 'system comment is filtered out');
+  assert.deepEqual(result[0]?.comments[0], { authorLogin: 'amy@acme.com', body: 'Root', createdAt: '2024-01-01T00:00:00Z' });
+  assert.deepEqual(result[0]?.comments[1], { authorLogin: 'raj@acme.com', body: 'Reply', createdAt: '2024-01-02T00:00:00Z' });
+});
+
+// ── B2.2: replyToThread + unresolveConversationThread ─────────────────────
+
+test('B2.2: replyToThread POSTs to the thread comments endpoint with parentCommentId:1', async () => {
+  let capturedUrl: string | undefined;
+  let capturedBody: Record<string, unknown> | undefined;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.replyToThread(REPO, 56, '1', 'LGTM!');
+  assert.equal(capturedUrl, 'https://dev.azure.com/acme/Widgets/_apis/git/repositories/widgets-api/pullrequests/56/threads/1/comments?api-version=7.1');
+  assert.deepEqual(capturedBody, { parentCommentId: 1, content: 'LGTM!', commentType: 1 });
+});
+
+test('B2.2: unresolveConversationThread PATCHes status="active"', async () => {
+  let capturedUrl: string | undefined;
+  let capturedBody: Record<string, unknown> | undefined;
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.unresolveConversationThread(REPO, 56, '1');
+  assert.equal(capturedUrl, 'https://dev.azure.com/acme/Widgets/_apis/git/repositories/widgets-api/pullrequests/56/threads/1?api-version=7.1');
+  assert.deepEqual(capturedBody, { status: 'active' });
+});
+
+// ── B3.1: submitReview with optional body ─────────────────────────────────
+
+test('B3.1: submitReview with body posts comment thread first, then casts vote', async () => {
+  const calls: string[] = [];
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('profile')) {
+      return jsonResponse({ id: 'uid-raj', emailAddress: 'raj@acme.com' });
+    }
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.getAuthenticatedLogin();
+  await client.submitReview(REPO, 56, 'approve', 'Looks great!');
+  assert.equal(calls.length, 2, 'should post thread comment then vote');
+  assert.ok(calls[0]?.includes('/threads'), 'first call must be the threads endpoint');
+  assert.ok(calls[1]?.includes('/reviewers/'), 'second call must be the reviewer vote endpoint');
+});
+
+test('B3.1: submitReview without body goes straight to the vote', async () => {
+  const calls: string[] = [];
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('profile')) {
+      return jsonResponse({ id: 'uid-raj', emailAddress: 'raj@acme.com' });
+    }
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.getAuthenticatedLogin();
+  await client.submitReview(REPO, 56, 'approve');
+  assert.equal(calls.length, 1, 'no body = just the vote');
+  assert.ok(calls[0]?.includes('/reviewers/'));
+});
+
+// ── B4.1: listChecks ──────────────────────────────────────────────────────
+
+test('B4.1: listChecks uses fetchAllSkip on PR statuses and returns CheckDetail[]', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullRequests/200/statuses')) {
+      return jsonResponse({
+        value: [
+          { context: { name: 'CI / build' }, state: 'succeeded', targetUrl: 'https://ci.example.com/1' },
+          { context: { name: 'CI / test' }, state: 'failed', targetUrl: 'https://ci.example.com/2' },
+          { context: { name: 'CI / lint' }, state: 'pending' },
+        ],
+      });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 200);
+  assert.equal(result.length, 3);
+  assert.deepEqual(result[0], { name: 'CI / build', status: 'passing', url: 'https://ci.example.com/1' });
+  assert.deepEqual(result[1], { name: 'CI / test', status: 'failing', url: 'https://ci.example.com/2' });
+  assert.deepEqual(result[2], { name: 'CI / lint', status: 'pending' });
+});
+
+test('B4.1: listChecks returns empty array when no statuses', async () => {
+  const client = new AzureDevOpsClient(IDENTITY, 'pat', 'pat', (async (url: string) => {
+    if (url.includes('/pullRequests/201/statuses')) return jsonResponse({ value: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 201);
+  assert.deepEqual(result, []);
 });

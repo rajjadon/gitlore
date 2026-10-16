@@ -136,6 +136,15 @@ export const REQUEST_CHANGES_ICON = icon('<circle cx="8" cy="8" r="5.3" /><path 
 /** Reopen a closed PR — a counter-clockwise restore arrow, distinct from Refresh's full circle so "reopen this" isn't mistaken for "reload the board". */
 export const REOPEN_ICON = icon('<path d="M3.5 8a4.5 4.5 0 1 0 1.4-3.27" /><path d="M2.5 2.5v3h3" />', 'action-icon', 12);
 
+/** CI checks section — a checklist glyph: three lines of varying length with a small tick in the corner. */
+export const CHECKS_ICON = icon(
+  '<path d="M3.5 4.5h9M3.5 8h6M3.5 11.5h7.5" /><path d="M12.5 9 11 10.5l-0.8-0.8" />',
+  'section-icon',
+);
+
+/** A small warning badge — exclamation mark — used inline next to text, smaller than the full REQUEST_CHANGES_ICON. */
+export const WARNING_INLINE_ICON = icon('<circle cx="8" cy="8" r="5.3" /><path d="M8 5.3v3" /><circle cx="8" cy="11" r="0.2" />', 'status-icon', 12);
+
 /** Merge a PR — two branch nodes converging into one, the standard git-merge glyph. */
 export const MERGE_ICON = icon(
   '<circle cx="4" cy="3.3" r="1.6" /><circle cx="12" cy="3.3" r="1.6" /><circle cx="8" cy="12.7" r="1.6" /><path d="M4 4.9v1.3a3 3 0 0 0 3 3h.3M12 4.9v1.3a3 3 0 0 1-3 3h-.3" />',

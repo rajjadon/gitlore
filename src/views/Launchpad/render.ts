@@ -1,6 +1,7 @@
 import { LAUNCHPAD_BUCKETS, pullRequestKey } from '../../core/forge/types';
 import type { CategorizedPullRequest, ForgeRepoRef, LaunchpadBucket, PullRequestSummary } from '../../core/forge/types';
 import { formatAge, formatAbsolute } from '../../utils/date';
+import { formatUpdatedAgo } from '../../utils/formatUpdatedAgo';
 import { escapeHtml } from '../escapeHtml';
 import { renderTooltipScript } from '../tooltipScript';
 import {
@@ -43,6 +44,8 @@ export interface LaunchpadData {
   errors: LaunchpadRepoError[];
   repoRows?: LaunchpadRepoRow[];
   now?: Date;
+  /** When set, renders "Updated N min ago" in the board header so the user knows how fresh the data is. */
+  lastLoadedAt?: Date;
 }
 
 const BUCKET_LABELS: Record<LaunchpadBucket, string> = {
@@ -57,7 +60,10 @@ const BUCKET_LABELS: Record<LaunchpadBucket, string> = {
   closed: 'Closed',
 };
 
-function renderCard(pr: PullRequestSummary, now: Date, bucket: LaunchpadBucket): string {
+/** Stale marker shown on cards whose data comes from a previous load because the repo's last refresh failed. */
+const STALE_MARKER = '<span class="stale-marker" title="Data from last successful load — this repo\'s latest refresh failed" aria-label="stale data">&#x26A0;&#xFE0E; stale</span>';
+
+function renderCard(pr: PullRequestSummary, now: Date, bucket: LaunchpadBucket, stale = false): string {
   const key = pullRequestKey(pr);
   const isTerminal = TERMINAL_BUCKETS.has(bucket);
   // A merged/closed card shows when it was closed, not when it was opened — that's the age that
@@ -100,7 +106,7 @@ ${stateActions}
 ${actions}
 </div>
 <div class="pr-card-title">${escapeHtml(pr.title)}</div>
-<div class="pr-card-meta">${AUTHOR_ICON}<span>${escapeHtml(pr.authorLogin)}</span><span class="pr-card-age" title="${escapeHtml(absolute)}">${escapeHtml(ageLabel)}</span></div>
+<div class="pr-card-meta">${AUTHOR_ICON}<span>${escapeHtml(pr.authorLogin)}</span><span class="pr-card-age" title="${escapeHtml(absolute)}">${escapeHtml(ageLabel)}</span>${stale ? STALE_MARKER : ''}</div>
 </div>`;
 }
 
@@ -130,7 +136,7 @@ function renderColumn(bucket: LaunchpadBucket, items: CategorizedPullRequest[], 
   const body =
     items.length === 0
       ? '<p class="column-empty">Nothing here.</p>'
-      : items.map((item) => renderCard(item.pr, now, bucket)).join('\n');
+      : items.map((item) => renderCard(item.pr, now, bucket, item.stale)).join('\n');
   return `<div class="column" data-bucket="${bucket}">
 <div class="column-head"><span class="column-title">${BUCKET_LABELS[bucket]}</span><span class="badge">${items.length}</span></div>
 <div class="column-body">${body}</div>
@@ -140,6 +146,7 @@ function renderColumn(bucket: LaunchpadBucket, items: CategorizedPullRequest[], 
 /** Builds Launchpad's full HTML document — a 6-column board of PRs pooled across every recognized repo in the workspace. Pure — nonce/cspSource/styleUris come from the caller, so this is unit-testable without a real webview host. */
 export function renderLaunchpadHtml(data: LaunchpadData, opts: RenderLaunchpadOptions): string {
   const now = data.now ?? new Date();
+  const updatedAgoText = data.lastLoadedAt ? escapeHtml(formatUpdatedAgo(data.lastLoadedAt, now)) : '';
   const styles = opts.styleUris.map((uri) => `<link rel="stylesheet" href="${uri}" />`).join('\n');
 
   const byBucket = new Map<LaunchpadBucket, CategorizedPullRequest[]>(LAUNCHPAD_BUCKETS.map((b) => [b, []]));
@@ -172,6 +179,7 @@ ${styles}
 <div class="toolbar">
 <span class="title">Launchpad</span>
 <span class="spacer"></span>
+${updatedAgoText ? `<span class="updated-ago" aria-live="polite">${updatedAgoText}</span>` : ''}
 <button id="refresh" class="icon-btn" type="button" data-tooltip="Refresh" aria-label="Refresh Launchpad">${REFRESH_ICON}</button>
 </div>
 ${repoList}

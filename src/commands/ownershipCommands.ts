@@ -29,7 +29,8 @@ export async function buildOwnershipQuickPickItems(
   }
 
   const ignoreWhitespace = config.get<boolean>(CONFIG.blameIgnoreWhitespace, true);
-  const blameLines = await source.getBlameLines(filePath, { ignoreWhitespace });
+  const detectMoves = config.get<boolean>(CONFIG.blameDetectMoves, false);
+  const blameLines = await source.getBlameLines(filePath, { ignoreWhitespace, detectMoves });
   if (!blameLines || blameLines.length === 0) {
     return null;
   }

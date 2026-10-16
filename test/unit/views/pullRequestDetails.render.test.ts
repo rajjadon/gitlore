@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderPullRequestDetailsHtml } from '../../../src/views/PullRequestDetails/render';
-import type { ConversationThread, PullRequestSummary } from '../../../src/core/forge/types';
+import { renderPullRequestDetailsHtml, renderChecks } from '../../../src/views/PullRequestDetails/render';
+import { diffCacheKey } from '../../../src/core/forge/PullRequestDiffCache';
+import type { CheckDetail, ConversationThread, PullRequestSummary } from '../../../src/core/forge/types';
 import type { FileChange } from '../../../src/core/git/types';
 
 process.env.TZ = 'UTC';
@@ -21,6 +22,7 @@ function pr(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
     ...overrides,
   };
 }
@@ -115,8 +117,8 @@ test('renderPullRequestDetailsHtml: shows a "No review conversations" message wh
 
 test('renderPullRequestDetailsHtml: an unresolved thread gets a Resolve button; a resolved one doesn\'t', () => {
   const threads: ConversationThread[] = [
-    { id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false },
-    { id: 't2', body: 'Already fine', authorLogin: 'raj', resolved: true },
+    { id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] },
+    { id: 't2', body: 'Already fine', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Already fine' }] },
   ];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
   assert.match(html, /class="thread gitlore-enter" data-thread-id="t1">[\s\S]*?class="thread-resolve[^"]*" type="button" data-thread-id="t1"/);
@@ -125,34 +127,35 @@ test('renderPullRequestDetailsHtml: an unresolved thread gets a Resolve button; 
 });
 
 test('renderPullRequestDetailsHtml: the Resolve button posts resolveThread with the thread\'s id', () => {
-  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false }];
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
-  assert.match(html, /vscode\.postMessage\(\{ type: 'resolveThread', threadId: btn\.dataset\.threadId \}\);/);
+  // Delegated listener — the resolveThread message is posted inside the threads click handler
+  assert.match(html, /type: 'resolveThread', threadId:/);
 });
 
 test('renderPullRequestDetailsHtml: escapes HTML special characters in thread fields', () => {
   const threads: ConversationThread[] = [
-    { id: 't1', body: '<script>alert(1)</script>', authorLogin: '<img src=x onerror=alert(1)>', resolved: false },
+    { id: 't1', body: '<script>alert(1)</script>', authorLogin: '<img src=x onerror=alert(1)>', resolved: false, comments: [{ authorLogin: '<img src=x onerror=alert(1)>', body: '<script>alert(1)</script>' }] },
   ];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
   assert.ok(!html.includes('<script>alert(1)</script>'));
   assert.ok(!html.includes('<img src=x onerror=alert(1)>'));
 });
 
-test('renderPullRequestDetailsHtml: a thread anchored to a diff line shows its file and line', () => {
-  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42 }];
+test('renderPullRequestDetailsHtml: a thread anchored to a diff line shows its file and line as a jump button', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
-  assert.match(html, /class="thread-location">src\/a\.ts:42</);
+  assert.match(html, /class="thread-location thread-jump-btn"[^>]*>src\/a\.ts:42</);
 });
 
-test('renderPullRequestDetailsHtml: Azure DevOps\' leading-slash file paths are shown without it', () => {
-  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: '/src/a.ts', line: 3 }];
+test('renderPullRequestDetailsHtml: Azure DevOps\' leading-slash file paths are shown without it as a jump button', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: '/src/a.ts', line: 3, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
-  assert.match(html, /class="thread-location">src\/a\.ts:3</);
+  assert.match(html, /class="thread-location thread-jump-btn"[^>]*>src\/a\.ts:3</);
 });
 
 test('renderPullRequestDetailsHtml: a general PR-level comment (not attached to any line) shows no location', () => {
-  const threads: ConversationThread[] = [{ id: 't1', body: 'Looks good overall', authorLogin: 'amy', resolved: false }];
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Looks good overall', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Looks good overall' }] }];
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
   assert.ok(!html.includes('thread-location'));
 });
@@ -208,9 +211,10 @@ test('renderPullRequestDetailsHtml: checkStatus "pending" shows a Checks running
   assert.match(html, /class="badge[^"]*">Checks running</);
 });
 
-test('renderPullRequestDetailsHtml: checkStatus "none" shows no checks badge at all — nothing to report', () => {
+test('renderPullRequestDetailsHtml: checkStatus "none" shows no checks status badge (passing/failing/running) — nothing to report', () => {
   const html = renderPullRequestDetailsHtml({ pr: pr({ checkStatus: 'none' }), files, diff, threads: [], now }, opts);
-  assert.ok(!html.includes('Checks'));
+  // The "Checks" section head is always shown; only the STATUS badge is absent for 'none'
+  assert.ok(!html.includes('Checks passing') && !html.includes('Checks failing') && !html.includes('Checks running'));
 });
 
 test('renderPullRequestDetailsHtml: reviewDecision "changesRequested" shows a Changes requested badge', () => {
@@ -309,10 +313,13 @@ test('renderPullRequestDetailsHtml: shows Merge only when approved, checks aren\
   assert.ok(!conflicted.includes('id="merge-pr"'));
 });
 
-test('renderPullRequestDetailsHtml: Approve posts submitReview with decision "approve"; Request Changes posts "requestChanges"', () => {
+test('renderPullRequestDetailsHtml: Approve posts submitReview with decision "approve" and optional body; Request Changes posts "requestChanges"', () => {
   const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
-  assert.match(html, /getElementById\('approve-pr'\)\?\.addEventListener\('click', \(\) => \{\s*vscode\.postMessage\(\{ type: 'submitReview', decision: 'approve' \}\);/);
-  assert.match(html, /getElementById\('request-changes-pr'\)\?\.addEventListener\('click', \(\) => \{\s*vscode\.postMessage\(\{ type: 'submitReview', decision: 'requestChanges' \}\);/);
+  // Body is captured from the review-body textarea and included in the message
+  assert.match(html, /getElementById\('approve-pr'\)\?\.addEventListener\('click'/);
+  assert.match(html, /type: 'submitReview', decision: 'approve'/);
+  assert.match(html, /getElementById\('request-changes-pr'\)\?\.addEventListener\('click'/);
+  assert.match(html, /type: 'submitReview', decision: 'requestChanges'/);
 });
 
 test('renderPullRequestDetailsHtml: Close/Reopen/Merge buttons post closePr/reopenPr/mergePr', () => {
@@ -325,4 +332,251 @@ test('renderPullRequestDetailsHtml: Close/Reopen/Merge buttons post closePr/reop
     opts,
   );
   assert.match(closed, /getElementById\('reopen-pr'\)\?\.addEventListener\('click', \(\) => \{\s*vscode\.postMessage\(\{ type: 'reopenPr' \}\);/);
+});
+
+// ─── B1.3 — diffCacheKey ────────────────────────────────────────────────────
+
+test('diffCacheKey: includes headSha so a force-push produces a different key', () => {
+  const base = {
+    repo: { host: 'github' as const, identity: 'acme/widgets', label: 'acme/widgets' },
+    number: 1, title: '', url: '', authorLogin: '', isDraft: false,
+    createdAt: '', updatedAt: '', requestedReviewers: [], checkStatus: 'none' as const,
+    reviewDecision: 'none' as const, hasConflicts: false, reviewedByMe: false,
+  };
+  const beforePush = diffCacheKey({ ...base, headSha: 'abc123' });
+  const afterPush  = diffCacheKey({ ...base, headSha: 'def456' });
+  assert.notEqual(beforePush, afterPush);
+});
+
+test('diffCacheKey: same PR + same headSha → same key (cache hit)', () => {
+  const base = {
+    repo: { host: 'github' as const, identity: 'acme/widgets', label: 'acme/widgets' },
+    number: 1, title: '', url: '', authorLogin: '', isDraft: false,
+    createdAt: '', updatedAt: '', requestedReviewers: [], checkStatus: 'none' as const,
+    reviewDecision: 'none' as const, hasConflicts: false, reviewedByMe: false, headSha: 'abc123',
+  };
+  assert.equal(diffCacheKey(base), diffCacheKey({ ...base }));
+});
+
+// ─── B2.3 — thread multi-comment, reply, unresolve ──────────────────────────
+
+test('renderPullRequestDetailsHtml: thread renders all comments (multi-comment thread)', () => {
+  const threads: ConversationThread[] = [{
+    id: 't1', body: 'First comment', authorLogin: 'amy', resolved: false,
+    comments: [
+      { authorLogin: 'amy', body: 'First comment' },
+      { authorLogin: 'raj', body: 'Second comment', createdAt: '2024-02-09T12:00:00Z' },
+    ],
+  }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads, now }, opts);
+  assert.match(html, /First comment/);
+  assert.match(html, /Second comment/);
+  assert.match(html, /class="thread-author">amy</);
+  assert.match(html, /class="thread-author">raj</);
+});
+
+test('renderPullRequestDetailsHtml: thread comment with createdAt shows relative time', () => {
+  const threads: ConversationThread[] = [{
+    id: 't1', body: 'Note', authorLogin: 'amy', resolved: false,
+    comments: [{ authorLogin: 'amy', body: 'Note', createdAt: '2024-02-09T12:00:00Z' }],
+  }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads, now }, opts);
+  // now = 2024-02-10T10:00:00Z, createdAt = 2024-02-09T12:00:00Z → ~22 hours ago
+  assert.match(html, /22 hours ago/);
+});
+
+test('renderPullRequestDetailsHtml: reply textarea and button are present in each thread', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.match(html, /class="thread-reply-body"[^>]*data-thread-id="t1"/);
+  assert.match(html, /class="[^"]*thread-reply-btn"[^>]*data-thread-id="t1"/);
+});
+
+test('renderPullRequestDetailsHtml: reply button posts replyToThread message via delegated listener', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.match(html, /type: 'replyToThread'/);
+});
+
+test('renderPullRequestDetailsHtml: a resolved thread has an Unresolve button, not a Resolve button', () => {
+  const threads: ConversationThread[] = [{ id: 't2', body: 'Done', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Done' }] }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.match(html, /class="[^"]*thread-unresolve[^"]*"/);
+  assert.ok(!html.includes('class="thread-resolve'));
+});
+
+test('renderPullRequestDetailsHtml: unresolve button posts unresolveThread message', () => {
+  const threads: ConversationThread[] = [{ id: 't2', body: 'Done', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Done' }] }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.match(html, /type: 'unresolveThread'/);
+});
+
+test('renderPullRequestDetailsHtml: XSS escaping in thread comment author and body (B7.1)', () => {
+  const threads: ConversationThread[] = [{
+    id: 't1', body: '<script>evil()</script>', authorLogin: '<img onerror=x>', resolved: false,
+    comments: [{ authorLogin: '<img onerror=x>', body: '<script>evil()</script>' }],
+  }];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.ok(!html.includes('<script>evil()</script>'));
+  assert.ok(!html.includes('<img onerror=x>'));
+  assert.ok(html.includes('&lt;script&gt;'));
+});
+
+// ─── B3.2 — review body textarea ────────────────────────────────────────────
+
+test('renderPullRequestDetailsHtml: a review-body textarea is rendered for open PRs (always visible, not hidden)', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
+  assert.match(html, /id="review-body"/);
+  // Must NOT be hidden by default — the old hidden-until-focus approach caused layout shifts
+  assert.ok(!/<textarea[^>]*id="review-body"[^>]*hidden/.test(html), 'textarea must not carry the hidden attribute');
+});
+
+test('renderPullRequestDetailsHtml: review-body has a visible label with correct for association', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
+  assert.match(html, /<label[^>]*for="review-body"/);
+  assert.match(html, /Review comment \(optional\)/);
+});
+
+test('renderPullRequestDetailsHtml: review-body section appears before the Approve button in DOM order (sits above review actions)', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
+  const reviewBodyIdx = html.indexOf('id="review-body"');
+  const approveIdx = html.indexOf('id="approve-pr"');
+  assert.ok(reviewBodyIdx > 0, 'review-body must be present');
+  assert.ok(approveIdx > 0, 'approve-pr must be present');
+  assert.ok(reviewBodyIdx < approveIdx, 'review-body textarea must appear before the Approve button');
+});
+
+test('renderPullRequestDetailsHtml: merged/closed PR does not render the review-body textarea', () => {
+  const html = renderPullRequestDetailsHtml(
+    { pr: pr({ closedAt: '2024-02-05T00:00:00Z', merged: true }), files, diff, threads: [], now },
+    opts,
+  );
+  assert.ok(!html.includes('id="review-body"'), 'no review textarea on a merged PR');
+});
+
+test('renderPullRequestDetailsHtml: Approve and Request Changes include the review body in the message', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
+  // The script reads the review-body textarea value and includes it as `body`
+  assert.match(html, /getElementById\('review-body'\)/);
+  assert.match(html, /body.*submitReview|submitReview.*body/s);
+});
+
+// ─── B4.3 — checks section ──────────────────────────────────────────────────
+
+test('renderPullRequestDetailsHtml: includes a checks section with a skeleton initially', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [], now }, opts);
+  assert.match(html, /id="checks-container"/);
+  assert.match(html, /class="skeleton"/);
+});
+
+test('renderChecks: failing checks appear before pending, pending before passing count', () => {
+  const checks: CheckDetail[] = [
+    { name: 'lint', status: 'passing' },
+    { name: 'ci/build', status: 'pending' },
+    { name: 'ci/test', status: 'failing' },
+  ];
+  const html = renderChecks(checks);
+  const failIdx = html.indexOf('ci/test');
+  const pendingIdx = html.indexOf('ci/build');
+  const passingIdx = html.indexOf('passing');
+  assert.ok(failIdx < pendingIdx, 'failing before pending');
+  assert.ok(pendingIdx < passingIdx, 'pending before passing count');
+});
+
+test('renderChecks: passing checks are collapsed to a count, not listed individually', () => {
+  const checks: CheckDetail[] = [
+    { name: 'lint', status: 'passing' },
+    { name: 'ci', status: 'passing' },
+  ];
+  const html = renderChecks(checks);
+  // A count like "2 checks passing" is shown; individual names NOT listed
+  assert.match(html, /2 checks? passing/);
+  // Individual passing check names should NOT appear as check rows
+  assert.ok(!html.includes('class="check-row check-passing"'));
+});
+
+test('renderChecks: a single passing check uses singular "check passing"', () => {
+  const checks: CheckDetail[] = [{ name: 'ci', status: 'passing' }];
+  const html = renderChecks(checks);
+  assert.match(html, /1 check passing/);
+});
+
+test('renderChecks: a check with a valid https URL is rendered as a link button', () => {
+  const checks: CheckDetail[] = [{ name: 'ci/test', status: 'failing', url: 'https://ci.example.com/job/1' }];
+  const html = renderChecks(checks);
+  assert.match(html, /data-check-url="https:\/\/ci\.example\.com\/job\/1"/);
+});
+
+test('renderChecks: a check with a javascript: URL is not rendered as a link (scheme validation)', () => {
+  const checks: CheckDetail[] = [{ name: 'ci/test', status: 'failing', url: 'javascript:alert(1)' }];
+  const html = renderChecks(checks);
+  assert.ok(!html.includes('data-check-url="javascript:alert(1)"'));
+});
+
+test('renderChecks: a check with no URL has no link button', () => {
+  const checks: CheckDetail[] = [{ name: 'lint', status: 'failing' }];
+  const html = renderChecks(checks);
+  assert.ok(!html.includes('data-check-url'));
+});
+
+test('renderChecks: empty checks array shows a "no checks" message', () => {
+  const html = renderChecks([]);
+  assert.match(html, /No checks/);
+});
+
+test('renderChecks: error string shows an inline error, not an empty list', () => {
+  const html = renderChecks([], 'network timeout');
+  assert.match(html, /network timeout/);
+});
+
+test('renderChecks: XSS escaping in check names and URLs (B7.1)', () => {
+  const checks: CheckDetail[] = [{ name: '<script>evil()</script>', status: 'failing', url: 'https://safe.example.com' }];
+  const html = renderChecks(checks);
+  assert.ok(!html.includes('<script>evil()</script>'));
+  assert.ok(html.includes('&lt;script&gt;'));
+});
+
+// ─── B5.1 — jump-to-line button ─────────────────────────────────────────────
+
+test('renderPullRequestDetailsHtml: thread with file in diff gets enabled jump button (B5.1)', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 5, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
+  // files includes 'src/a.ts'
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  // Button is enabled (no disabled attribute) and carries the anchor file
+  assert.match(html, /class="thread-location thread-jump-btn"[^>]*data-anchor-file="src\/a\.ts"/);
+  assert.ok(!html.includes('disabled>src/a.ts'));
+});
+
+test('renderPullRequestDetailsHtml: thread with file NOT in diff gets disabled jump button with explanation (B5.1)', () => {
+  const threads: ConversationThread[] = [{ id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'other/file.ts', line: 5, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }];
+  // files only has 'src/a.ts', not 'other/file.ts'
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.match(html, /class="thread-location thread-jump-btn"[^>]*disabled/);
+  assert.match(html, /other\/file\.ts/);
+});
+
+// ─── B6.1 — unresolved badge ────────────────────────────────────────────────
+
+test('renderPullRequestDetailsHtml: unresolved badge shows count when > 0 (B6.1)', () => {
+  const threads: ConversationThread[] = [
+    { id: 't1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }] },
+    { id: 't2', body: 'Fix that', authorLogin: 'raj', resolved: false, comments: [{ authorLogin: 'raj', body: 'Fix that' }] },
+    { id: 't3', body: 'Done', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Done' }] },
+  ];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  // Badge must show count AND text (not color alone)
+  assert.match(html, /2 unresolved/);
+});
+
+test('renderPullRequestDetailsHtml: unresolved badge is hidden when all threads are resolved (B6.1)', () => {
+  const threads: ConversationThread[] = [
+    { id: 't1', body: 'Done', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Done' }] },
+  ];
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads }, opts);
+  assert.ok(!html.includes('unresolved'));
+});
+
+test('renderPullRequestDetailsHtml: unresolved badge is hidden when there are no threads (B6.1)', () => {
+  const html = renderPullRequestDetailsHtml({ pr: pr(), files, diff, threads: [] }, opts);
+  assert.ok(!html.includes('unresolved'));
 });

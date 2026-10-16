@@ -27,17 +27,37 @@ declare function getComputedStyle(element: unknown): { display: string };
  * already needed the same fix, for the same reason — this guards `.skeleton` from losing it again.
  */
 
-let browser: Browser;
+let browser: Browser | undefined;
+
+// SuiteContext (before/after) has no .skip(); we set a flag and check it inside each test()
+// where TestContext.skip() is available.
+let browserMissing = false;
 
 test.before(async () => {
-  browser = await chromium.launch();
+  try {
+    browser = await chromium.launch();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("Executable doesn't exist")) {
+      // Chromium not installed — mark so each test can skip itself.
+      // Run `npx playwright install chromium` to enable these tests.
+      browserMissing = true;
+    } else {
+      throw err;
+    }
+  }
 });
 
 test.after(async () => {
-  await browser.close();
+  // browser may be undefined when before() could not launch due to a missing executable.
+  await browser?.close();
 });
 
-test('.skeleton actually disappears when toggled hidden, not just marked hidden in the DOM', async () => {
+test('.skeleton actually disappears when toggled hidden, not just marked hidden in the DOM', async (t) => {
+  if (browserMissing || !browser) {
+    t.skip('Chromium executable missing — run `npx playwright install chromium` to enable this test');
+    return;
+  }
   const page = await browser.newPage();
   try {
     await page.setContent(`<!DOCTYPE html><html><head><style>${SHARED_CSS}</style></head>

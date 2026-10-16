@@ -60,6 +60,7 @@ import {
   handleCreateStashCommand,
 } from './commands/explorerCommands';
 import { handleRecoverFromReflogCommand } from './commands/reflogCommands';
+import { handleFindWhenTextChangedCommand } from './commands/localHistoryCommands';
 import { CommitDetailsViewProvider } from './views/CommitDetails/CommitDetailsViewProvider';
 import { CommitGraphViewProvider, resolveRepoContextPath } from './views/CommitGraph/CommitGraphViewProvider';
 import { BranchComparisonViewProvider } from './views/BranchComparison/BranchComparisonViewProvider';
@@ -68,8 +69,12 @@ import { RebaseEditorProvider } from './views/RebaseEditor/RebaseEditorProvider'
 import { LaunchpadViewProvider } from './views/Launchpad/LaunchpadViewProvider';
 import { handleOpenLaunchpadCommand } from './commands/launchpadCommands';
 import { PullRequestDetailsViewProvider } from './views/PullRequestDetails/PullRequestDetailsViewProvider';
-import { handleShowPullRequestCommand } from './commands/pullRequestCommands';
+import { handleShowPullRequestCommand, handleOpenPullRequestForCommitCommand } from './commands/pullRequestCommands';
+import { CommitPullRequestResolver } from './core/forge/CommitPullRequestResolver';
+import { buildForgeClient } from './core/forge/buildForgeClient';
+import { azureDevOpsCredentialScheme } from './providers/forgeCredentials';
 import { RepoExplorerProvider } from './providers/RepoExplorerProvider';
+import { LaunchpadStatusBar } from './providers/LaunchpadStatusBar';
 import { LanguageModelClient } from './ai/LanguageModelClient';
 import { LineExplanationService } from './ai/LineExplanationService';
 import { CommitMessageService } from './ai/CommitMessageService';
@@ -82,6 +87,7 @@ export interface GitLoreTestApi {
   blameProvider: BlameDecorationProvider;
   fileHistoryProvider: FileHistoryProvider;
   statusBarProvider: StatusBarProvider;
+  launchpadStatusBar: LaunchpadStatusBar;
   ownershipProvider: OwnershipDecorationProvider;
   fullFileBlameProvider: FullFileBlameDecorationProvider;
   git: GitService;
@@ -147,6 +153,12 @@ export function activate(ctx: vscode.ExtensionContext): GitLoreTestApi {
   const rebaseEditorProvider = new RebaseEditorProvider(ctx.extensionUri);
   const launchpadProvider = new LaunchpadViewProvider(ctx.extensionUri, ctx, git, logger);
   const pullRequestDetailsViewProvider = new PullRequestDetailsViewProvider(ctx.extensionUri, languageModelClient, logger);
+  // F2.3: per-(repo, sha) result cache for blame hover "Open PR" lookups. The factory mirrors how
+  // LaunchpadViewProvider builds clients — same flavor/apiBaseUrl/identity/token/credentialScheme
+  // shape, only using the global `fetch` (no per-instance override needed here).
+  const commitPrResolver = new CommitPullRequestResolver((detected, identity, token) =>
+    buildForgeClient(detected.flavor, detected.apiBaseUrl, identity, token, azureDevOpsCredentialScheme(detected)),
+  );
   const chatService = new ChatService(git, languageModelClient, logger);
   const chatViewProvider = new ChatViewProvider(ctx.extensionUri, chatService);
   const repoExplorerProvider = new RepoExplorerProvider(git);
@@ -183,6 +195,7 @@ export function activate(ctx: vscode.ExtensionContext): GitLoreTestApi {
     launchpadProvider,
     handleOpenLaunchpadCommand(launchpadProvider),
     handleShowPullRequestCommand(pullRequestDetailsViewProvider, launchpadProvider),
+    handleOpenPullRequestForCommitCommand(git, ctx.secrets, commitPrResolver, launchpadProvider, output),
     handleExplainPullRequestCommand(pullRequestDetailsViewProvider),
     handleDraftPrReviewCommand(pullRequestDetailsViewProvider),
     repoExplorerProvider,
@@ -200,6 +213,7 @@ export function activate(ctx: vscode.ExtensionContext): GitLoreTestApi {
     handleRemoveWorktreeCommand(git, repoExplorerProvider),
     handleCreateStashCommand(git, repoExplorerProvider),
     handleRecoverFromReflogCommand(git, repoExplorerProvider),
+    handleFindWhenTextChangedCommand(git),
     repoExplorerProvider.watchActiveEditor(),
     vscode.window.registerTreeDataProvider(VIEWS.explorer, repoExplorerProvider),
     vscode.window.registerCustomEditorProvider(VIEWS.rebaseEditor, rebaseEditorProvider),
@@ -230,12 +244,18 @@ export function activate(ctx: vscode.ExtensionContext): GitLoreTestApi {
   }
   setImmediate(() => void warnIfGitUnavailable(ctx, git));
 
+  // D1.1/D1.2: LaunchpadStatusBar is constructed here (StatusBarItem creation is < 1 ms) but its
+  // initial network refresh is deferred via setImmediate internally, keeping activate() < 50 ms.
+  const launchpadStatusBar = new LaunchpadStatusBar(git, ctx.secrets, logger);
+  ctx.subscriptions.push(launchpadStatusBar);
+
   output.appendLine('GitLore activated.');
 
   return {
     blameProvider,
     fileHistoryProvider,
     statusBarProvider,
+    launchpadStatusBar,
     ownershipProvider,
     fullFileBlameProvider,
     git,

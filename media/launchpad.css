@@ -57,6 +57,27 @@ body {
   margin-right: 0.2rem;
 }
 
+/* C3.1: "Updated N ago" in the toolbar */
+.updated-ago {
+  font-size: 0.8em;
+  color: var(--gl-text-muted);
+  margin-right: 0.5rem;
+}
+
+/* C3.2: stale data marker — text + icon, never color alone */
+.stale-marker {
+  margin-left: 0.5rem;
+  font-size: 0.75em;
+  color: var(--gl-text-muted);
+  /* Respect prefers-reduced-motion: no animation */
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .stale-marker {
+    opacity: 0.85;
+  }
+}
+
 .errors {
   flex: 0 0 auto;
   padding: 0.4rem 1rem;

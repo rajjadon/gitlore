@@ -320,14 +320,14 @@ test('listRecentlyClosedPullRequests: combines MERGED and DECLINED, tagging each
     if (url.includes('state=MERGED')) {
       return jsonResponse({
         values: [
-          { id: 30, title: 'Shipped', links: { html: { href: 'u1' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u' },
+          { id: 30, title: 'Shipped', links: { html: { href: 'u1' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha30' } } },
         ],
       });
     }
     if (url.includes('state=DECLINED')) {
       return jsonResponse({
         values: [
-          { id: 31, title: 'Declined', links: { html: { href: 'u2' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u' },
+          { id: 31, title: 'Declined', links: { html: { href: 'u2' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha31' } } },
         ],
       });
     }
@@ -518,8 +518,8 @@ test('listConversationThreads: only top-level comments (no parent) are returned 
   );
   const result = await client.listConversationThreads(REPO, 38);
   assert.deepEqual(result, [
-    { id: '1', body: 'Fix this', authorLogin: 'amy', resolved: false },
-    { id: '3', body: 'Already fine', authorLogin: 'raj', resolved: true },
+    { id: '1', body: 'Fix this', authorLogin: 'amy', resolved: false, comments: [{ authorLogin: 'amy', body: 'Fix this' }, { authorLogin: 'raj', body: 'On it' }] },
+    { id: '3', body: 'Already fine', authorLogin: 'raj', resolved: true, comments: [{ authorLogin: 'raj', body: 'Already fine' }] },
   ]);
 });
 
@@ -534,7 +534,7 @@ test('listConversationThreads: surfaces the file/line an inline comment is ancho
     }),
   );
   const result = await client.listConversationThreads(REPO, 38);
-  assert.deepEqual(result, [{ id: '1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42 }]);
+  assert.deepEqual(result, [{ id: '1', body: 'Fix this', authorLogin: 'amy', resolved: false, file: 'src/a.ts', line: 42, comments: [{ authorLogin: 'amy', body: 'Fix this' }] }]);
 });
 
 test('resolveConversationThread: POSTs to /comments/{id}/resolve', async () => {
@@ -676,4 +676,376 @@ test('A4: enrich fan-out is bounded — concurrent enrichment calls stay within 
   await client.listOpenPullRequests(REPO);
   assert.ok(maxConcurrentEnrichs <= 6, `max concurrent enrichments should be ≤ 6, was ${maxConcurrentEnrichs}`);
   assert.ok(maxConcurrentEnrichs > 1, 'must use some concurrency (not fully serial)');
+});
+
+// ── B1.1: headSha in PullRequestSummary ───────────────────────────────────
+
+test('B1.1: enrich populates headSha from source.commit.hash', async () => {
+  const client = new BitbucketClient(BASE, 'tok', fakeFetch({
+    '/repositories/acme/widgets/pullrequests/7': {
+      id: 7, title: 'PR', links: { html: { href: 'u' } },
+      author: { username: 'raj' }, created_on: 'c', updated_on: 'u',
+      source: { commit: { hash: 'deadbeef' } },
+    },
+    '/statuses': { values: [] },
+  }));
+  const result = await client.getPullRequest(REPO, 7);
+  assert.equal(result.headSha, 'deadbeef');
+});
+
+test('B1.1: fetchClosedList populates headSha from source.commit.hash', async () => {
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/user')) return jsonResponse({ username: 'raj', uuid: '{uuid-raj}' });
+    if (url.includes('state=MERGED')) return jsonResponse({
+      values: [{
+        id: 10, title: 'Closed', links: { html: { href: 'u' } },
+        author: { username: 'raj' }, created_on: 'c', updated_on: 'u',
+        source: { commit: { hash: 'cafebabe' } },
+      }],
+    });
+    if (url.includes('state=DECLINED')) return jsonResponse({ values: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  await client.getAuthenticatedLogin();
+  const result = await client.listRecentlyClosedPullRequests(REPO);
+  assert.equal(result[0]?.headSha, 'cafebabe');
+});
+
+// ── B1.2: pagination — /diffstat and /comments ────────────────────────────
+
+test('B1.2: getPullRequestDiff paginates /diffstat via body.next and returns all entries', async () => {
+  const page2Url = `${BASE}/repositories/acme/widgets/pullrequests/34/diffstat?page=2`;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/34/diff')) return textResponse('diff text');
+    if (url.endsWith('/pullrequests/34/diffstat')) {
+      return jsonResponse({
+        values: [{ status: 'modified', lines_added: 1, lines_removed: 0, new: { path: 'a.ts' }, old: { path: 'a.ts' } }],
+        next: page2Url,
+      });
+    }
+    if (url === page2Url) {
+      return jsonResponse({ values: [{ status: 'added', lines_added: 5, lines_removed: 0, new: { path: 'b.ts' }, old: null }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 34);
+  assert.equal(result.files.length, 2, 'must return files from both pages');
+  assert.equal(result.files[0]?.path, 'a.ts');
+  assert.equal(result.files[1]?.path, 'b.ts');
+});
+
+test('B1.2: listConversationThreads paginates /comments via body.next (2 pages)', async () => {
+  const page2Url = `${BASE}/repositories/acme/widgets/pullrequests/38/comments?page=2`;
+  let callCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    callCount++;
+    if (url.endsWith('/pullrequests/38/comments')) {
+      return jsonResponse({
+        values: [{ id: 1, content: { raw: 'Page 1' }, user: { username: 'amy' } }],
+        next: page2Url,
+      });
+    }
+    if (url === page2Url) {
+      return jsonResponse({ values: [{ id: 2, content: { raw: 'Page 2' }, user: { username: 'raj' } }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 38);
+  assert.equal(callCount, 2);
+  assert.equal(result.length, 2);
+  assert.equal(result[0]?.id, '1');
+  assert.equal(result[1]?.id, '2');
+});
+
+// B1.2 boundary: Bitbucket /diffstat — pagelen=50, so single page=50 items, second page at 51
+
+test('B1.2: getPullRequestDiff /diffstat — exactly 50 items single page (pagelen=50), no second request', async () => {
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/34/diff')) return textResponse('diff');
+    if (url.includes('/pullrequests/34/diffstat')) {
+      reqCount++;
+      return jsonResponse({ values: Array.from({ length: 50 }, (_, i) => ({ status: 'modified', lines_added: 1, lines_removed: 0, new: { path: `f${i}.ts` }, old: { path: `f${i}.ts` } })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 34);
+  assert.equal(reqCount, 1, 'single /diffstat request for 50 items (pagelen=50)');
+  assert.equal(result.files.length, 50);
+});
+
+test('B1.2: getPullRequestDiff /diffstat — 51 items across 2 pages (pagelen=50), all returned', async () => {
+  const page2Url = `${BASE}/repositories/acme/widgets/pullrequests/34/diffstat?page=2`;
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/34/diff')) return textResponse('diff');
+    if (url.endsWith('/pullrequests/34/diffstat')) {
+      reqCount++;
+      return jsonResponse({
+        values: Array.from({ length: 50 }, (_, i) => ({ status: 'modified', lines_added: 1, lines_removed: 0, new: { path: `f${i}.ts` }, old: { path: `f${i}.ts` } })),
+        next: page2Url,
+      });
+    }
+    if (url === page2Url) {
+      reqCount++;
+      return jsonResponse({ values: [{ status: 'added', lines_added: 5, lines_removed: 0, new: { path: 'extra.ts' }, old: null }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 34);
+  assert.equal(reqCount, 2, '2 /diffstat requests for 51 items (pagelen=50)');
+  assert.equal(result.files.length, 51);
+});
+
+test('B1.2: getPullRequestDiff /diffstat — always-next source stops at MAX_PAGES (10)', async () => {
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/34/diff')) return textResponse('diff');
+    if (url.includes('/pullrequests/34/diffstat')) {
+      reqCount++;
+      const nextUrl = `${BASE}/repositories/acme/widgets/pullrequests/34/diffstat?page=${reqCount + 1}`;
+      return jsonResponse({ values: [{ status: 'added', lines_added: 1, lines_removed: 0, new: { path: `f${reqCount}.ts` }, old: null }], next: nextUrl });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.getPullRequestDiff(REPO, 34);
+  assert.equal(reqCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.files.length, 10);
+});
+
+// B1.2 boundary: Bitbucket /comments — pagelen=50
+
+test('B1.2: listConversationThreads /comments — exactly 50 items single page (pagelen=50), no second request', async () => {
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/pullrequests/38/comments')) {
+      reqCount++;
+      return jsonResponse({ values: Array.from({ length: 50 }, (_, i) => ({ id: i + 1, content: { raw: `C${i}` }, user: { username: 'u' } })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 38);
+  assert.equal(reqCount, 1, 'single /comments request for 50 items (pagelen=50)');
+  assert.equal(result.length, 50);
+});
+
+test('B1.2: listConversationThreads /comments — 51 items across 2 pages (pagelen=50), all returned', async () => {
+  const page2Url = `${BASE}/repositories/acme/widgets/pullrequests/38/comments?page=2`;
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/38/comments')) {
+      reqCount++;
+      return jsonResponse({
+        values: Array.from({ length: 50 }, (_, i) => ({ id: i + 1, content: { raw: `C${i}` }, user: { username: 'u' } })),
+        next: page2Url,
+      });
+    }
+    if (url === page2Url) {
+      reqCount++;
+      return jsonResponse({ values: [{ id: 51, content: { raw: 'Last' }, user: { username: 'u' } }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 38);
+  assert.equal(reqCount, 2, '2 /comments requests for 51 items (pagelen=50)');
+  assert.equal(result.length, 51);
+});
+
+test('B1.2: listConversationThreads /comments — always-next source stops at MAX_PAGES (10)', async () => {
+  let reqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/pullrequests/38/comments')) {
+      reqCount++;
+      const nextUrl = `${BASE}/repositories/acme/widgets/pullrequests/38/comments?page=${reqCount + 1}`;
+      return jsonResponse({ values: [{ id: reqCount, content: { raw: `C${reqCount}` }, user: { username: 'u' } }], next: nextUrl });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listConversationThreads(REPO, 38);
+  assert.equal(reqCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.length, 10);
+});
+
+// B1.2 boundary: Bitbucket commit /statuses — paginated via fetchAllPages with body.next
+
+test('B1.2: listChecks /commit/statuses — exactly 50 items single page (pagelen=50), no second request', async () => {
+  let statusReqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/202')) {
+      return jsonResponse({ id: 202, title: 'PR', links: { html: { href: 'u' } }, author: { username: 'u' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha202' } } });
+    }
+    if (url.includes('/commit/sha202/statuses')) {
+      statusReqCount++;
+      return jsonResponse({ values: Array.from({ length: 50 }, (_, i) => ({ key: `k${i}`, state: 'SUCCESSFUL' })) });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 202);
+  assert.equal(statusReqCount, 1, 'single /statuses request for 50 items (pagelen=50)');
+  assert.equal(result.length, 50);
+});
+
+test('B1.2: listChecks /commit/statuses — 51 items across 2 pages (pagelen=50), all returned', async () => {
+  const page2Url = `${BASE}/repositories/acme/widgets/commit/sha203/statuses?page=2`;
+  let statusReqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/203')) {
+      return jsonResponse({ id: 203, title: 'PR', links: { html: { href: 'u' } }, author: { username: 'u' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha203' } } });
+    }
+    if (url.endsWith('/commit/sha203/statuses')) {
+      statusReqCount++;
+      return jsonResponse({ values: Array.from({ length: 50 }, (_, i) => ({ key: `k${i}`, state: 'SUCCESSFUL' })), next: page2Url });
+    }
+    if (url === page2Url) {
+      statusReqCount++;
+      return jsonResponse({ values: [{ key: 'k50', state: 'FAILED' }] });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 203);
+  assert.equal(statusReqCount, 2, '2 /statuses requests for 51 items (pagelen=50)');
+  assert.equal(result.length, 51);
+});
+
+test('B1.2: listChecks /commit/statuses — always-next source stops at MAX_PAGES (10)', async () => {
+  let statusReqCount = 0;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/204')) {
+      return jsonResponse({ id: 204, title: 'PR', links: { html: { href: 'u' } }, author: { username: 'u' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha204' } } });
+    }
+    if (url.includes('/commit/sha204/statuses')) {
+      statusReqCount++;
+      const nextUrl = `${BASE}/repositories/acme/widgets/commit/sha204/statuses?page=${statusReqCount + 1}`;
+      return jsonResponse({ values: [{ key: `k${statusReqCount}`, state: 'SUCCESSFUL' }], next: nextUrl });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 204);
+  assert.equal(statusReqCount, 10, 'must stop at MAX_PAGES=10');
+  assert.equal(result.length, 10);
+});
+
+// ── B2.1: ConversationThread.comments array ────────────────────────────────
+
+test('B2.1: listConversationThreads groups replies into comments array under their parent', async () => {
+  const client = new BitbucketClient(BASE, 'tok', fakeFetch({
+    'pullrequests/38/comments': {
+      values: [
+        { id: 10, content: { raw: 'Top-level' }, user: { username: 'amy' }, created_on: '2024-01-01T00:00:00Z' },
+        { id: 11, content: { raw: 'Reply 1' }, user: { username: 'raj' }, parent: { id: 10 }, created_on: '2024-01-02T00:00:00Z' },
+        { id: 12, content: { raw: 'Reply 2' }, user: { username: 'bob' }, parent: { id: 10 }, created_on: '2024-01-03T00:00:00Z' },
+      ],
+    },
+  }));
+  const result = await client.listConversationThreads(REPO, 38);
+  assert.equal(result.length, 1, 'only the top-level comment is a thread');
+  assert.equal(result[0]?.comments.length, 3, 'top-level + 2 replies = 3 comments');
+  assert.deepEqual(result[0]?.comments[0], { authorLogin: 'amy', body: 'Top-level', createdAt: '2024-01-01T00:00:00Z' });
+  assert.deepEqual(result[0]?.comments[1], { authorLogin: 'raj', body: 'Reply 1', createdAt: '2024-01-02T00:00:00Z' });
+  assert.deepEqual(result[0]?.comments[2], { authorLogin: 'bob', body: 'Reply 2', createdAt: '2024-01-03T00:00:00Z' });
+});
+
+// ── B2.2: replyToThread + unresolveConversationThread ─────────────────────
+
+test('B2.2: replyToThread POSTs with parent.id to the comments endpoint', async () => {
+  let capturedUrl: string | undefined;
+  let capturedBody: Record<string, unknown> | undefined;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.replyToThread(REPO, 38, '10', 'LGTM!');
+  assert.equal(capturedUrl, 'https://api.bitbucket.org/2.0/repositories/acme/widgets/pullrequests/38/comments');
+  assert.deepEqual(capturedBody, { content: { raw: 'LGTM!' }, parent: { id: 10 } });
+});
+
+test('B2.2: unresolveConversationThread DELETEs the /resolve endpoint', async () => {
+  let capturedUrl: string | undefined;
+  let capturedMethod: string | undefined;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string, init?: RequestInit) => {
+    capturedUrl = url;
+    capturedMethod = init?.method;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.unresolveConversationThread(REPO, 38, '10');
+  assert.equal(capturedUrl, 'https://api.bitbucket.org/2.0/repositories/acme/widgets/pullrequests/38/comments/10/resolve');
+  assert.equal(capturedMethod, 'DELETE');
+});
+
+// ── B3.1: submitReview with optional body ─────────────────────────────────
+
+test('B3.1: submitReview with body posts comment first, then casts vote', async () => {
+  const calls: string[] = [];
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.submitReview(REPO, 35, 'approve', 'Looks great!');
+  assert.equal(calls.length, 2, 'should make 2 requests: comment then approve');
+  assert.ok(calls[0]?.includes('/comments'), 'first call must be the comment endpoint');
+  assert.ok(calls[1]?.includes('/approve'), 'second call must be the approve endpoint');
+});
+
+test('B3.1: submitReview comment failure blocks the vote', async () => {
+  let approveAttempted = false;
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.includes('/comments')) return new Response('Error', { status: 500, statusText: 'Internal Server Error' });
+    approveAttempted = true;
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await assert.rejects(() => client.submitReview(REPO, 35, 'approve', 'Body text'));
+  assert.equal(approveAttempted, false, 'approve must not be called when comment fails');
+});
+
+test('B3.1: submitReview without body goes straight to the vote', async () => {
+  const calls: string[] = [];
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    calls.push(url);
+    return jsonResponse({});
+  }) as unknown as typeof fetch);
+  await client.submitReview(REPO, 35, 'approve');
+  assert.equal(calls.length, 1, 'no body = just the vote');
+  assert.ok(calls[0]?.includes('/approve'));
+});
+
+// ── B4.1: listChecks ──────────────────────────────────────────────────────
+
+test('B4.1: listChecks fetches PR for SHA then build statuses, returning CheckDetail[]', async () => {
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/200')) {
+      return jsonResponse({
+        id: 200, title: 'PR', links: { html: { href: 'u' } },
+        author: { username: 'raj' }, created_on: 'c', updated_on: 'u',
+        source: { commit: { hash: 'sha200' } },
+      });
+    }
+    if (url.includes('/commit/sha200/statuses')) {
+      return jsonResponse({
+        values: [
+          { key: 'ci/build', name: 'CI Build', state: 'SUCCESSFUL', url: 'https://ci.example.com/1' },
+          { key: 'ci/test', name: 'CI Test', state: 'FAILED', url: 'https://ci.example.com/2' },
+          { key: 'ci/lint', state: 'INPROGRESS' },
+        ],
+      });
+    }
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 200);
+  assert.equal(result.length, 3);
+  assert.deepEqual(result[0], { name: 'CI Build', status: 'passing', url: 'https://ci.example.com/1' });
+  assert.deepEqual(result[1], { name: 'CI Test', status: 'failing', url: 'https://ci.example.com/2' });
+  assert.deepEqual(result[2], { name: 'ci/lint', status: 'pending' });
+});
+
+test('B4.1: listChecks returns empty array when no statuses exist', async () => {
+  const client = new BitbucketClient(BASE, 'tok', (async (url: string) => {
+    if (url.endsWith('/pullrequests/201')) {
+      return jsonResponse({ id: 201, title: 'PR', links: { html: { href: 'u' } }, author: { username: 'raj' }, created_on: 'c', updated_on: 'u', source: { commit: { hash: 'sha201' } } });
+    }
+    if (url.includes('/commit/sha201/statuses')) return jsonResponse({ values: [] });
+    throw new Error(`unmocked: ${url}`);
+  }) as unknown as typeof fetch);
+  const result = await client.listChecks(REPO, 201);
+  assert.deepEqual(result, []);
 });

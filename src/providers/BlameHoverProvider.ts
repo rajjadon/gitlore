@@ -14,6 +14,7 @@ const HOVER_ENABLED_COMMANDS = [
   COMMANDS.compareBranches,
   COMMANDS.showFileHistory,
   COMMANDS.copySha,
+  COMMANDS.openPullRequestForCommit,
 ];
 
 export class BlameHoverProvider implements vscode.HoverProvider {
@@ -40,7 +41,8 @@ export class BlameHoverProvider implements vscode.HoverProvider {
 
     try {
       const ignoreWhitespace = this.getConfig<boolean>(CONFIG.blameIgnoreWhitespace, true);
-      const lines = await this.source.getBlameLines(doc.uri.fsPath, { ignoreWhitespace });
+      const detectMoves = this.getConfig<boolean>(CONFIG.blameDetectMoves, false);
+      const lines = await this.source.getBlameLines(doc.uri.fsPath, { ignoreWhitespace, detectMoves });
       if (token?.isCancellationRequested) {
         return undefined;
       }
@@ -60,7 +62,15 @@ export class BlameHoverProvider implements vscode.HoverProvider {
         const navIndex = this.lineHistoryNavStore.get(navKey) ?? 0;
 
         if (navIndex > 0) {
-          const history = await this.git.getLineHistory(doc.uri.fsPath, pos.line);
+          // Use the active editor's selection range when it spans the hover line — lets the user
+          // step through the history of a block of lines rather than just a single line.
+          const sel = vscode.window.activeTextEditor?.selection;
+          const selEndLine =
+            sel && !sel.isEmpty && sel.start.line !== sel.end.line &&
+            sel.start.line <= pos.line && sel.end.line >= pos.line
+              ? sel.end.line
+              : undefined;
+          const history = await this.git.getLineHistory(doc.uri.fsPath, pos.line, selEndLine);
           if (token?.isCancellationRequested) {
             return undefined;
           }
@@ -96,8 +106,9 @@ export class BlameHoverProvider implements vscode.HoverProvider {
         lineExplanation = this.lineExplanationStore.get(key);
       }
 
+      const launchpadEnabled = this.getConfig<boolean>(CONFIG.launchpadEnabled, false);
       const markdown = new vscode.MarkdownString(
-        formatBlameHover(entry, diffStat, doc.uri.fsPath, lineContent, lineExplanation, undefined, issueLinking),
+        formatBlameHover(entry, diffStat, doc.uri.fsPath, lineContent, lineExplanation, undefined, issueLinking, launchpadEnabled),
       );
       markdown.isTrusted = { enabledCommands: HOVER_ENABLED_COMMANDS };
       markdown.supportThemeIcons = true;

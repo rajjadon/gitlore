@@ -1,4 +1,5 @@
 import type {
+  CheckDetail,
   ConversationThread,
   CreatePullRequestOptions,
   ForgeRepoRef,
@@ -52,16 +53,22 @@ export interface ForgeClient {
    */
   getPullRequest(repo: ForgeRepoRef, number: number): Promise<PullRequestSummary>;
   /**
-   * Submits an approve/request-changes review decision. Throws with the real reason (HTTP status,
-   * network failure, a permissions rejection) on failure — same contract as `closePullRequest`.
-   * GitLab has no formal "request changes" review state (see `GitLabClient.submitReview`), so
-   * `'requestChanges'` there throws a clear, platform-specific message instead of faking a state
-   * that doesn't exist — never a silent no-op.
+   * Submits an approve/request-changes review decision, optionally with a review comment body.
+   * Throws with the real reason (HTTP status, network failure, a permissions rejection) on failure —
+   * same contract as `closePullRequest`. GitLab has no formal "request changes" review state (see
+   * `GitLabClient.submitReview`), so `'requestChanges'` there throws a clear, platform-specific
+   * message instead of faking a state that doesn't exist — never a silent no-op.
+   *
+   * Body handling varies by host:
+   * - **GitHub**: `body` is sent directly in the review POST.
+   * - **GitLab / Bitbucket / Azure DevOps**: `body` is posted as a comment *before* the vote is
+   *   cast. If the comment POST fails, the vote is never cast. Empty or whitespace-only bodies
+   *   skip the comment step entirely.
    */
-  submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission): Promise<void>;
+  submitReview(repo: ForgeRepoRef, number: number, decision: ReviewSubmission, body?: string): Promise<void>;
   /** Posts a top-level comment on the PR (not a reply to any specific review thread). Throws with the real reason on failure — same contract as `closePullRequest`. */
   addComment(repo: ForgeRepoRef, number: number, body: string): Promise<void>;
-  /** Every review conversation on this PR, resolved or not — see `ConversationThread`. */
+  /** Every review conversation on this PR, resolved or not — see `ConversationThread`. Each thread's `comments` array is populated (oldest first). */
   listConversationThreads(repo: ForgeRepoRef, number: number): Promise<ConversationThread[]>;
   /**
    * Marks a conversation thread resolved. Throws with the real reason on failure — same contract
@@ -69,6 +76,40 @@ export interface ForgeClient {
    * (see `GitHubClient`'s dedicated `graphql()` request path, alongside its normal REST `request()`).
    */
   resolveConversationThread(repo: ForgeRepoRef, number: number, threadId: string): Promise<void>;
+  /**
+   * Posts a reply to an existing conversation thread. Throws with the real reason on failure —
+   * same contract as `closePullRequest`.
+   *
+   * Per-host implementation:
+   * - **GitHub**: GraphQL `addPullRequestReviewThreadReply` mutation.
+   * - **GitLab**: `POST .../discussions/:id/notes`.
+   * - **Bitbucket**: `POST .../comments` with `parent: { id }`.
+   * - **Azure DevOps**: `POST .../threads/:id/comments` with `parentCommentId: 1`.
+   */
+  replyToThread(repo: ForgeRepoRef, number: number, threadId: string, body: string): Promise<void>;
+  /**
+   * Marks a conversation thread unresolved (reverses a prior `resolveConversationThread` call).
+   * Throws with the real reason on failure — same contract as `closePullRequest`.
+   *
+   * Per-host implementation:
+   * - **GitHub**: GraphQL `unresolveReviewThread` mutation.
+   * - **GitLab**: `PUT .../discussions/:id?resolved=false`.
+   * - **Bitbucket**: `DELETE .../comments/:id/resolve`.
+   * - **Azure DevOps**: `PATCH .../threads/:id` with `status: "active"`.
+   */
+  unresolveConversationThread(repo: ForgeRepoRef, number: number, threadId: string): Promise<void>;
+  /**
+   * Returns the named checks (CI jobs, build statuses) for this PR's head commit. Returns `[]`
+   * rather than throwing when the host has no checks for this PR. Throws with the real reason for
+   * actual network/auth failures.
+   *
+   * Per-host implementation:
+   * - **GitHub**: check-runs at `/commits/{sha}/check-runs` (requires fetching the PR first for the SHA).
+   * - **GitLab**: head-pipeline jobs at `/pipelines/{id}/jobs`.
+   * - **Bitbucket**: commit statuses at `/commit/{sha}/statuses`.
+   * - **Azure DevOps**: PR statuses at `/pullRequests/{id}/statuses`.
+   */
+  listChecks(repo: ForgeRepoRef, number: number): Promise<CheckDetail[]>;
   /**
    * Merges an open PR/MR with the given strategy, optionally deleting its source branch
    * afterward. Throws with the real reason (HTTP status, network failure, a permissions
@@ -91,4 +132,24 @@ export interface ForgeClient {
    * see `GitLabClient.createPullRequest`.
    */
   createPullRequest(repo: ForgeRepoRef, options: CreatePullRequestOptions): Promise<PullRequestSummary>;
+  /**
+   * Finds the PR/MR associated with a specific commit SHA, preferring a merged PR over an open or
+   * closed-without-merging one. Returns `null` when no PR on this host references the commit (e.g.
+   * the commit hasn't been pushed yet, or the branch was squash-merged so the original commit SHA
+   * isn't in the target branch). A `404` from the host means the commit is completely unknown to it
+   * and is treated as `null`; any other HTTP error (401, 403, 429, 5xx) or network failure throws
+   * with the real reason, same contract as `closePullRequest`.
+   *
+   * One page only — a commit is in at most a handful of PRs in practice, and walking `MAX_PAGES`
+   * for something the user triggered per hover-click would be disproportionately slow.
+   *
+   * Per-host implementation:
+   * - **GitHub**: `GET /repos/{r}/commits/{sha}/pulls`; each PR has `merged_at` to distinguish.
+   * - **GitLab**: `GET /projects/:id/repository/commits/:sha/merge_requests`; `state: 'merged'` preferred.
+   * - **Bitbucket**: `GET /repositories/{r}/commit/{sha}/pullrequests`; `state: 'MERGED'` preferred.
+   * - **Azure DevOps**: `POST …/pullrequestquery?api-version=7.1` with two query types
+   *   (`lastMergeCommit` for completed PRs, `commit` for active ones) in a single request; results
+   *   from `lastMergeCommit` are preferred.
+   */
+  findPullRequestForCommit(repo: ForgeRepoRef, sha: string): Promise<{ number: number; title: string; url: string } | null>;
 }

@@ -5,17 +5,9 @@ import { renderFileHistoryHtml } from './render';
 import { renderPlaceholderHtml } from '../placeholder';
 import { waitForWebviewView } from '../waitForWebviewView';
 import { COMMANDS, CONFIG, MEDIA, VIEWS } from '../../constants';
+import { createNonce } from '../nonce';
 
 const DEFAULT_MAX_HISTORY_ITEMS = 200;
-
-function createNonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let nonce = '';
-  for (let i = 0; i < 32; i++) {
-    nonce += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  }
-  return nonce;
-}
 
 /** Docks the Visual File History bubble timeline in the bottom panel, alongside Commit Graph/Details/Branch Comparison. */
 export class VisualFileHistoryViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {

@@ -45,6 +45,16 @@ function buildQuickActionsRow(sha: string): string {
 }
 
 /**
+ * "Open PR" link — only rendered when `gitLore.launchpad.enabled` is true (the one setting that
+ * authorises calls to a remote host). Resolved on click, never on hover — the hover merely builds
+ * the URI; the command does the actual network call so the hover stays fast and private.
+ */
+function buildOpenPrLink(filePath: string, sha: string): string {
+  const args = encodeURIComponent(JSON.stringify([filePath, sha]));
+  return `[$(git-pull-request) Open PR](command:${COMMANDS.openPullRequestForCommit}?${args})`;
+}
+
+/**
  * The lone "Older" link shown on the *live* blame card (nothing to page through yet — going
  * "forward" from the current line doesn't mean anything). Deliberately doesn't show a "N of M"
  * count: that would require fetching the line's full `-L` history — a meaningfully more
@@ -124,6 +134,7 @@ export function formatBlameHover(
   lineExplanation: LineExplanationState | undefined,
   now: Date = new Date(),
   issueLinking: IssueLinkOptions | null = null,
+  launchpadEnabled: boolean = false,
 ): string {
   if (entry.isUncommitted) {
     return '**Uncommitted changes**\n\nThis line has not been committed yet.\n\n---';
@@ -157,6 +168,9 @@ export function formatBlameHover(
   }
 
   lines.push('', buildQuickActionsRow(entry.sha));
+  if (launchpadEnabled) {
+    lines.push('', buildOpenPrLink(filePath, entry.sha));
+  }
   lines.push('', buildLineHistoryNavLink(filePath, entry.line));
   lines.push('', formatLineExplanation(lineExplanation, filePath, entry.sha, lineContent));
   lines.push('', '---');

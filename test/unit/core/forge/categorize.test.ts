@@ -21,6 +21,7 @@ function pr(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
     ...overrides,
   };
 }
@@ -211,4 +212,37 @@ test('categorizePullRequests: requestedReviewers match is case-insensitive (N5)'
 test('categorizeClosedPullRequests: authorLogin match is case-insensitive (N5)', () => {
   const result = categorizeClosedPullRequests([pr({ authorLogin: 'RAJ', merged: true, closedAt: '2024-01-05T00:00:00Z' })], 'raj');
   assert.equal(result[0]?.bucket, 'merged');
+});
+
+// ─── C4.1: reviewer-owned PR bucket rule (L9) ────────────────────────────────
+// A PR you did NOT author never goes to Blocked — a requested review wins → Needs Review.
+// Blocked is only for PRs you authored (failing CI / changes requested / conflicts).
+
+test('C4.1: reviewer + failing CI → needsReview, not blocked (non-authored PR)', () => {
+  // I am a requested reviewer on someone else's PR with failing CI
+  const result = categorizePullRequests(
+    [pr({ authorLogin: 'someone-else', requestedReviewers: [ME], checkStatus: 'failing' })],
+    ME,
+    neverSnoozed,
+  );
+  assert.equal(result[0]?.bucket, 'needsReview');
+});
+
+test('C4.1: own PR + failing CI → blocked', () => {
+  const result = categorizePullRequests(
+    [pr({ authorLogin: ME, checkStatus: 'failing' })],
+    ME,
+    neverSnoozed,
+  );
+  assert.equal(result[0]?.bucket, 'blocked');
+});
+
+test('C4.1: reviewer-requested + changes requested by someone else → needsReview, not blocked', () => {
+  // Another reviewer requested changes, but I'm still a requested reviewer — not blocked (I don't own it)
+  const result = categorizePullRequests(
+    [pr({ authorLogin: 'someone-else', requestedReviewers: [ME], reviewDecision: 'changesRequested' })],
+    ME,
+    neverSnoozed,
+  );
+  assert.equal(result[0]?.bucket, 'needsReview');
 });

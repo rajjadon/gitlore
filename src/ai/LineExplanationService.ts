@@ -8,6 +8,7 @@ import { buildLineExplanationPrompt } from '../core/ai/prompts';
 import { buildLineExplanationKey, type LineExplanationState } from '../core/ai/lineExplanationKey';
 import { describeNoModelReason } from '../core/ai/modelAvailability';
 import { CONFIG } from '../constants';
+import { showAiDisabledNotice } from './showAiDisabledNotice';
 
 /**
  * Runs "Explain This Line's History" headlessly — no webview, no panel. Writes its outcome into
@@ -50,11 +51,7 @@ export class LineExplanationService {
     // output would otherwise be thrown away when AI is off, and the hover would show a transient
     // "Generating explanation…" for no reason.
     if (!enabled) {
-      void vscode.window.showInformationMessage('GitLore: AI features are disabled.', 'Open Settings').then((choice) => {
-        if (choice) {
-          void vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG.section}.${CONFIG.aiEnabled}`);
-        }
-      });
+      void showAiDisabledNotice();
       this.store.delete(key);
       return;
     }

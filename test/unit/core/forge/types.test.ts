@@ -18,6 +18,7 @@ function pr(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
     reviewDecision: 'approved',
     hasConflicts: false,
     reviewedByMe: false,
+    headSha: '',
     ...overrides,
   };
 }
